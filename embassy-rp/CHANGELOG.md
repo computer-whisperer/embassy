@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add fix #4822 in PIO onewire. Change to disable the state machine before setting y register ([#4824](https://github.com/embassy-rs/embassy/pull/4824))
 - Add PIO::Ws2812 color order support
 - Add I2C bus lockup detection and recovery (recovery is async-only)
+- Fix i2c_slave respond_to_read for buffers larger than one chunk
 
 ## 0.8.0 - 2025-08-26
 
