@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Fixed documentation and assertion of STATE partition size requirements
 - Added documentation for package features
+- increase hashing chunk buffer in `verify_and_mark_updated()` to 4 bytes for compatibility with RP2040 async flash
 
 ## 0.6.1 - 2025-08-26
 
