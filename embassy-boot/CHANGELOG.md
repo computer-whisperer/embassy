@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Made `read_state` on `BootLoader` public
 - Update embassy-embedded-hal to 0.6.0
 - Update embassy-sync to 0.8.0
+- increase hashing chunk buffer in `verify_and_mark_updated()` to 4 bytes for compatibility with RP2040 async flash
 
 ## 0.6.1 - 2025-08-26
 
