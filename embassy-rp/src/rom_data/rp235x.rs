@@ -634,9 +634,20 @@ declare_rom_function! {
     /// See datasheet section 5.5.12.1 for more details.
     ///
     /// Supported architectures: ARM-S, RISC-V
-    unsafe fn pick_ab_parition(workarea_base: *mut u8, workarea_size: usize, partition_a_num: u32) -> i32 {
+    unsafe fn pick_ab_partition(workarea_base: *mut u8, workarea_size: usize, partition_a_num: u32, flash_update_boot_window_base: u32) -> i32 {
         crate::rom_data::rom_table_lookup(*b"AB", crate::rom_data::inner::rt_flags::FUNC_ARM_SEC_RISCV)
     }
+}
+
+/// Backwards-compatible wrapper for the misspelled `pick_ab_parition` symbol.
+///
+/// Prefer calling [`pick_ab_partition`] directly so callers can pass an explicit
+/// `flash_update_boot_window_base` (as per the RP2350 bootrom API signature).
+#[deprecated(note = "typo in name and missing argument; use pick_ab_partition(workarea_base, workarea_size, partition_a_num, flash_update_boot_window_base)")]
+pub unsafe fn pick_ab_parition(workarea_base: *mut u8, workarea_size: usize, partition_a_num: u32) -> i32 {
+    // Use the XIP base from embassy-rp's flash module so we don't introduce a
+    // numeric constant here. This yields flash_update_boot_offset == 0.
+    pick_ab_partition(workarea_base, workarea_size, partition_a_num, crate::flash::FLASH_BASE as u32)
 }
 
 declare_rom_function! {
