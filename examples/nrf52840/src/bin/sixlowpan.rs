@@ -49,11 +49,9 @@ async fn main(spawner: Spawner) {
     let peer = Ipv6Addr::new(0xfe80, 0, 0, 0, 0xd701, 0xda3f, 0x3955, 0x82a4);
     let local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0xd701, 0xda3f, 0x3955, 0x82a5);
 
-    let config = embassy_net::Config::ipv6_static(StaticConfigV6 {
-        address: Ipv6Cidr::new(local, 64),
-        gateway: None,
-        dns_servers: Default::default(),
-    });
+    let mut v6_config = StaticConfigV6::new();
+    v6_config.push_address(Ipv6Cidr::new(local, 64));
+    let config = embassy_net::Config::ipv6_static(v6_config);
 
     // Generate random seed
     let mut rng = Rng::new(p.RNG, Irqs);
