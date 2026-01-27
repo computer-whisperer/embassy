@@ -38,8 +38,6 @@ pub const FLASH_BASE_UNCACHED: u32 = 0x14000000;
 /// been configured by the bootrom to remap a partition).
 ///
 /// On RP2040 this is the same as [`FLASH_BASE_UNCACHED`] since ATRANS does not exist.
-///
-/// See the module-level documentation for more details on XIP address windows.
 #[cfg(feature = "rp2040")]
 pub const FLASH_BASE_UNTRANSLATED: u32 = 0x13000000;
 
@@ -51,8 +49,6 @@ pub const FLASH_BASE_UNTRANSLATED: u32 = 0x13000000;
 /// been configured by the bootrom to remap a partition).
 ///
 /// On RP2040 this is the same as `FLASH_BASE_UNCACHED` since ATRANS does not exist.
-///
-/// See the module-level documentation for more details on XIP address windows.
 #[cfg(feature = "_rp235x")]
 pub const FLASH_BASE_UNTRANSLATED: u32 = 0x1C000000;
 
@@ -116,23 +112,19 @@ impl NorFlashError for Error {
 
 /// Future that waits for completion of a background read
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct BackgroundRead<'a, 'd, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32 = FLASH_BASE> {
-    flash: PhantomData<&'a mut Flash<'d, T, Async, FLASH_SIZE, READ_BASE>>,
+pub struct BackgroundRead<'a, 'd, T: Instance, const FLASH_SIZE: usize> {
+    flash: PhantomData<&'a mut Flash<'d, T, Async, FLASH_SIZE>>,
     transfer: Transfer<'a, AnyChannel>,
 }
 
-impl<'a, 'd, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32> Future
-    for BackgroundRead<'a, 'd, T, FLASH_SIZE, READ_BASE>
-{
+impl<'a, 'd, T: Instance, const FLASH_SIZE: usize> Future for BackgroundRead<'a, 'd, T, FLASH_SIZE> {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.transfer).poll(cx)
     }
 }
 
-impl<'a, 'd, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32> Drop
-    for BackgroundRead<'a, 'd, T, FLASH_SIZE, READ_BASE>
-{
+impl<'a, 'd, T: Instance, const FLASH_SIZE: usize> Drop for BackgroundRead<'a, 'd, T, FLASH_SIZE> {
     fn drop(&mut self) {
         if pac::XIP_CTRL.stream_ctr().read().0 == 0 {
             return;
@@ -326,10 +318,12 @@ impl<'d, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32> Flash<'d, T
     /// # Example
     ///
     /// ```ignore
-    /// use embassy_rp::flash::{Flash, FLASH_SIZE, FLASH_BASE_UNTRANSLATED};
+    /// use embassy_rp::flash::{Flash, FLASH_BASE_UNTRANSLATED};
+    ///
+    /// const FLASH_SIZE: usize = 2 * 1024 * 1024; // 2MB, adjust for your flash
     ///
     /// // Read from physical flash offset 0x2000 (bypassing ATRANS)
-    /// let mut flash = Flash::<_, _, FLASH_SIZE, FLASH_BASE_UNTRANSLATED>::new_blocking_with_base(p.FLASH);
+    /// let mut flash = Flash::<_, _, { FLASH_SIZE }, FLASH_BASE_UNTRANSLATED>::new_blocking_with_base(p.FLASH);
     /// let mut buf = [0u8; 256];
     /// flash.blocking_read(0x2000, &mut buf).unwrap();
     /// ```
@@ -353,46 +347,22 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
     }
 }
 
-impl<'d, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32> Flash<'d, T, Async, FLASH_SIZE, READ_BASE> {
-    /// Create a new flash driver in async mode with a custom read base address.
-    ///
-    /// Use [`FLASH_BASE_UNTRANSLATED`] to bypass ATRANS on RP2350 and read from
-    /// physical flash addresses directly. This is useful when ATRANS has been
-    /// configured (e.g., by the bootrom) and you need to access flash at known
-    /// physical offsets.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use embassy_rp::flash::{Flash, FLASH_SIZE, FLASH_BASE_UNTRANSLATED};
-    ///
-    /// // Read from physical flash offset 0x2000 with DMA (bypassing ATRANS)
-    /// let mut flash = Flash::<_, _, FLASH_SIZE, FLASH_BASE_UNTRANSLATED>::new_with_base(p.FLASH, p.DMA_CH0);
-    /// let mut buf = [0u8; 256];
-    /// flash.read(0x2000, &mut buf).await.unwrap();
-    /// ```
-    pub fn new_with_base(_flash: Peri<'d, T>, dma: Peri<'d, impl Channel>) -> Self {
-        Self {
-            dma: Some(dma.into()),
-            phantom: PhantomData,
-        }
-    }
-
+impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
     /// Start a background read operation.
     ///
     /// The offset and buffer must be aligned.
     ///
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
-    /// The actual address read from is `READ_BASE + offset`.
+    /// The actual address read from is `FLASH_BASE + offset`.
     pub fn background_read<'a>(
         &'a mut self,
         offset: u32,
         data: &'a mut [u32],
-    ) -> Result<BackgroundRead<'a, 'd, T, FLASH_SIZE, READ_BASE>, Error> {
+    ) -> Result<BackgroundRead<'a, 'd, T, FLASH_SIZE>, Error> {
         trace!(
             "Reading in background from 0x{:x} to 0x{:x}",
-            READ_BASE + offset,
-            READ_BASE + offset + (data.len() * 4) as u32
+            FLASH_BASE + offset,
+            FLASH_BASE + offset + (data.len() * 4) as u32
         );
         // Can't use check_read because we need to enforce 4-byte alignment
         let offset = offset as usize;
@@ -410,7 +380,7 @@ impl<'d, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32> Flash<'d, T
 
         pac::XIP_CTRL
             .stream_addr()
-            .write_value(pac::xip_ctrl::regs::StreamAddr(READ_BASE + offset as u32));
+            .write_value(pac::xip_ctrl::regs::StreamAddr(FLASH_BASE + offset as u32));
         pac::XIP_CTRL
             .stream_ctr()
             .write_value(pac::xip_ctrl::regs::StreamCtr(data.len() as u32));
@@ -437,11 +407,12 @@ impl<'d, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32> Flash<'d, T
         })
     }
 
-    /// Async read.
+    /// Async read using DMA streaming.
     ///
-    /// The offset and buffer must be aligned.
+    /// The offset and buffer must be aligned to 4 bytes.
     ///
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// This method uses XIP streaming which only works with the default FLASH_BASE.
     pub async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Error> {
         use core::mem::MaybeUninit;
 
@@ -508,8 +479,8 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> Mu
 {
 }
 
-impl<'d, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32>
-    embedded_storage_async::nor_flash::MultiwriteNorFlash for Flash<'d, T, Async, FLASH_SIZE, READ_BASE>
+impl<'d, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash::MultiwriteNorFlash
+    for Flash<'d, T, Async, FLASH_SIZE>
 {
 }
 
@@ -529,13 +500,13 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> No
     }
 }
 
-impl<'d, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32>
-    embedded_storage_async::nor_flash::ReadNorFlash for Flash<'d, T, Async, FLASH_SIZE, READ_BASE>
+impl<'d, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash::ReadNorFlash
+    for Flash<'d, T, Async, FLASH_SIZE>
 {
     const READ_SIZE: usize = ASYNC_READ_SIZE;
 
     async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
-        self.read(offset, bytes).await
+        Self::read(self, offset, bytes).await
     }
 
     fn capacity(&self) -> usize {
@@ -543,8 +514,8 @@ impl<'d, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32>
     }
 }
 
-impl<'d, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32>
-    embedded_storage_async::nor_flash::NorFlash for Flash<'d, T, Async, FLASH_SIZE, READ_BASE>
+impl<'d, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash::NorFlash
+    for Flash<'d, T, Async, FLASH_SIZE>
 {
     const WRITE_SIZE: usize = WRITE_SIZE;
 
@@ -558,6 +529,7 @@ impl<'d, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32>
         self.blocking_write(offset, bytes)
     }
 }
+
 
 #[allow(dead_code)]
 mod ram_helpers {
