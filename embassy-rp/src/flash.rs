@@ -293,6 +293,33 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> Fl
         };
         Ok(jedec.unwrap())
     }
+
+    /// Explicitly invalidate a flash range in the XIP cache.
+    ///
+    /// Normally you don't need to call this — [`blocking_erase`] and [`blocking_write`]
+    /// automatically invalidate the modified regions. However, this method is useful when:
+    ///
+    /// - External code (e.g., a bootloader) has modified flash without using this driver
+    /// - You need to ensure fresh reads after flash modifications via DMA or other means
+    /// - You're implementing custom flash protocols that bypass the standard write path
+    ///
+    /// This performs targeted invalidation of only the specified range, which is much
+    /// faster than a full cache flush for small regions. Unlike [`flash_flush_cache()`]
+    /// from the bootrom, this does NOT unpin pinned cache lines, making it safe for
+    /// cache-as-SRAM use cases.
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - Start offset from flash base (must be 4-byte aligned on RP2040, 8-byte on RP2350)
+    /// * `to` - End offset from flash base (exclusive, must maintain same alignment as `from`)
+    ///
+    /// [`blocking_erase`]: Self::blocking_erase
+    /// [`blocking_write`]: Self::blocking_write
+    pub fn invalidate_cache_range(&mut self, from: u32, to: u32) {
+        // Safety: Cache invalidation writes are always safe as they only affect
+        // the CPU's view of memory, not the underlying flash content.
+        unsafe { cache::invalidate_range(from, to) }
+    }
 }
 
 impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Blocking, FLASH_SIZE> {
@@ -531,6 +558,131 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash
 }
 
 
+/// XIP cache maintenance operations.
+///
+/// This module provides targeted cache invalidation as an optimization over the bootrom's
+/// `flash_flush_cache()` which flushes the entire 16KB XIP cache. Targeted invalidation
+/// only invalidates the specific address range that was modified, preserving cached code
+/// in other regions and avoiding the performance penalty of cache warm-up.
+///
+/// Reference: pico-sdk `hardware_xip_cache/xip_cache.c`
+mod cache {
+    use core::arch::asm;
+
+    /// Memory barrier to ensure subsequent accesses observe the new cache state.
+    ///
+    /// This uses DSB (Data Synchronization Barrier) followed by ISB (Instruction
+    /// Synchronization Barrier) to ensure:
+    /// 1. All memory accesses before the barrier complete before any after it
+    /// 2. The pipeline is flushed so subsequent instructions see the new cache state
+    #[inline(always)]
+    unsafe fn post_maintenance_barrier() {
+        // DSB SY - full system data synchronization barrier
+        // ISB - instruction synchronization barrier
+        #[cfg(target_arch = "arm")]
+        asm!("dsb sy", "isb", options(nostack, preserves_flags));
+    }
+
+    /// Invalidate cache lines covering the given flash offset range on RP2040.
+    ///
+    /// RP2040 has TWO valid flags per 8-byte cache line (one per 4-byte half),
+    /// so we must write to every 4-byte aligned address to clear both flags.
+    ///
+    /// From RP2040 datasheet Section 2.6.3.2:
+    /// > "A write to the 0x10... mirror will look up the addressed location in
+    /// > the cache, and delete any matching entry found."
+    ///
+    /// # Safety
+    /// - `from` must be 4-byte aligned
+    /// - `to - from` must be a multiple of 4 bytes
+    /// - Should be called after flash operations complete and XIP is re-enabled
+    #[cfg(feature = "rp2040")]
+    #[inline(never)]
+    #[unsafe(link_section = ".data.ram_func")]
+    pub(super) unsafe fn invalidate_range(from: u32, to: u32) {
+        const XIP_BASE: u32 = 0x10000000;
+
+        debug_assert!(from & 0x3 == 0, "from must be 4-byte aligned");
+        debug_assert!((to.wrapping_sub(from)) & 0x3 == 0, "size must be multiple of 4");
+
+        let mut addr = from;
+        while addr < to {
+            // Write to 0x10... alias to invalidate this 4-byte half of the cache line
+            core::ptr::write_volatile((XIP_BASE + addr) as *mut u32, 0);
+            addr += 4;
+        }
+        post_maintenance_barrier();
+    }
+
+    /// Invalidate cache lines covering the given flash offset range on RP2350.
+    ///
+    /// RP2350 uses explicit cache maintenance operations via the 0x18... window.
+    /// Operation code 0x2 = invalidate by address.
+    ///
+    /// From RP2350 datasheet Section 4.4.1.1:
+    /// > "By address: Looks up an address in the cache, then performs the
+    /// > requested maintenance if that line is currently allocated."
+    ///
+    /// # Safety
+    /// - `from` must be 8-byte aligned (cache line boundary)
+    /// - `to - from` must be a multiple of 8 bytes
+    /// - Should be called after flash operations complete and XIP is re-enabled
+    #[cfg(feature = "_rp235x")]
+    #[inline(never)]
+    #[unsafe(link_section = ".data.ram_func")]
+    pub(super) unsafe fn invalidate_range(from: u32, to: u32) {
+        const XIP_MAINTENANCE_BASE: u32 = 0x18000000;
+        const INVALIDATE_BY_ADDR: u32 = 0x2;
+
+        debug_assert!(from & 0x7 == 0, "from must be 8-byte aligned");
+        debug_assert!((to.wrapping_sub(from)) & 0x7 == 0, "size must be multiple of 8");
+
+        let mut addr = from;
+        while addr < to {
+            // Write to maintenance window: base + offset + operation
+            // Using u8 write as pico-sdk does (strb instruction)
+            let maint_addr = (XIP_MAINTENANCE_BASE + addr + INVALIDATE_BY_ADDR) as *mut u8;
+            core::ptr::write_volatile(maint_addr, 0);
+            addr += 8;
+        }
+        post_maintenance_barrier();
+    }
+
+    /// Clear the QSPI_SS IO override that flash_exit_xip() sets on RP2040.
+    ///
+    /// The bootrom's flash_exit_xip() uses IO forcing to drive CS high. This
+    /// must be cleared before returning to XIP mode. Normally flash_flush_cache()
+    /// handles this, but since we're using targeted invalidation instead, we
+    /// need to clear it explicitly.
+    ///
+    /// From pico-sdk flash.c:
+    /// > "Note this is needed to remove CSn IO force as well as cache flushing"
+    ///
+    /// Note: This function is currently unused because the CS clearing is inlined
+    /// in the write_flash_inner asm for efficiency. Kept for documentation and
+    /// potential future use.
+    ///
+    /// # Safety
+    /// Must be called after flash operations but before flash_enter_cmd_xip()
+    #[cfg(feature = "rp2040")]
+    #[inline(never)]
+    #[unsafe(link_section = ".data.ram_func")]
+    #[allow(dead_code)]
+    pub(super) unsafe fn clear_cs_io_force() {
+        // IO_QSPI_GPIO_QSPI_SS_CTRL register address
+        // IO_QSPI_BASE (0x40018000) + GPIO_QSPI_SS_CTRL offset (0x0c)
+        const GPIO_QSPI_SS_CTRL: u32 = 0x4001800c;
+        // OUTOVER field: bits 9:8
+        const OUTOVER_BITS: u32 = 0x00000300;
+
+        let ctrl = GPIO_QSPI_SS_CTRL as *mut u32;
+        let val = core::ptr::read_volatile(ctrl);
+        // Clear OUTOVER bits to return to NORMAL (peripheral controls output)
+        let new_val = val & !OUTOVER_BITS;
+        core::ptr::write_volatile(ctrl, new_val);
+    }
+}
+
 #[allow(dead_code)]
 mod ram_helpers {
     use super::*;
@@ -720,6 +872,9 @@ mod ram_helpers {
     #[unsafe(link_section = ".data.ram_func")]
     #[cfg(feature = "rp2040")]
     unsafe fn write_flash_inner(addr: u32, len: u32, data: Option<&[u8]>, ptrs: *const FlashFunctionPointers) {
+        let out_addr: u32;
+        let out_len: u32;
+
         #[cfg(target_arch = "arm")]
         core::arch::asm!(
             "mov r8, r0",
@@ -751,11 +906,32 @@ mod ram_helpers {
             "blx r4", // flash_range_program(addr, data, len);
             "2:",
 
-            "ldr r4, [{ptrs}, #16]",
-            "blx r4", // flash_flush_cache();
+            // Clear CS IO force instead of calling flash_flush_cache().
+            // flash_exit_xip() forces CS high via IO override; we must clear
+            // this before returning to XIP mode. Normally flash_flush_cache()
+            // handles this, but we use targeted invalidation instead.
+            //
+            // GPIO_QSPI_SS_CTRL = 0x4001800c, OUTOVER bits = 9:8 (mask 0x300)
+            // Build address 0x4001800c (Cortex-M0+ can only use 8-bit immediates)
+            "movs r0, #0x40",
+            "lsls r0, r0, #24",   // r0 = 0x40000000
+            "movs r1, #0x18",
+            "lsls r1, r1, #12",   // r1 = 0x18000
+            "adds r0, r0, r1",    // r0 = 0x40018000
+            "adds r0, #0xc",      // r0 = 0x4001800c (GPIO_QSPI_SS_CTRL)
+            "ldr r1, [r0]",       // r1 = *GPIO_QSPI_SS_CTRL
+            "movs r2, #0x03",
+            "lsls r2, r2, #8",    // r2 = 0x300 (OUTOVER_BITS)
+            "bics r1, r2",        // r1 &= ~OUTOVER_BITS (clear to NORMAL)
+            "str r1, [r0]",       // *GPIO_QSPI_SS_CTRL = r1
 
             "ldr r4, [{ptrs}, #20]",
             "blx r4", // flash_enter_cmd_xip();
+
+            // Copy saved addr/len from high registers to low registers for output.
+            // High registers (r8+) can only be used as clobbers in Thumb-1 code.
+            "mov r0, r8",   // r0 = addr (for output)
+            "mov r1, r10",  // r1 = len (for output)
             ptrs = in(reg) ptrs,
             // Registers r8-r15 are not allocated automatically,
             // so assign them manually. We need to use them as
@@ -765,11 +941,18 @@ mod ram_helpers {
             in("r1") len,
             out("r3") _,
             out("r4") _,
+            lateout("r0") out_addr,
+            lateout("r1") out_len,
             lateout("r8") _,
             lateout("r9") _,
             lateout("r10") _,
             clobber_abi("C"),
         );
+
+        // Targeted cache invalidation for the modified flash range.
+        // This runs after XIP is re-enabled, so it can execute from flash.
+        // Much faster than full cache flush for bulk operations.
+        super::cache::invalidate_range(out_addr, out_addr.wrapping_add(out_len));
     }
 
     /// # Safety
@@ -794,8 +977,14 @@ mod ram_helpers {
         if (*ptrs).flash_range_program.is_some() {
             ((*ptrs).flash_range_program.unwrap())(addr, data as *const _, len as usize);
         }
-        ((*ptrs).flash_flush_cache)();
+        // RP2350 does not require CS IO force cleanup (QMI handles this differently).
+        // Skip flash_flush_cache() and use targeted invalidation instead.
         ((*ptrs).flash_enter_cmd_xip)();
+
+        // Targeted cache invalidation for the modified flash range.
+        // This runs after XIP is re-enabled, so it can execute from flash.
+        // Much faster than full cache flush for bulk operations.
+        super::cache::invalidate_range(addr, addr.wrapping_add(len));
     }
 
     #[repr(C)]
