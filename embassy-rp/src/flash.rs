@@ -683,6 +683,129 @@ mod cache {
     }
 }
 
+/// Hardware state save/restore for flash operations on RP2350.
+///
+/// This module saves and restores QSPI pad and QMI configuration around flash
+/// operations. This is necessary because:
+///
+/// 1. `flash_exit_xip()` modifies QSPI pad configuration (pull-ups/downs)
+/// 2. The BOOTRAM XIP setup function may not restore the exact QMI configuration
+///    that was set up by the bootloader's boot2
+/// 3. `flash_exit_xip()` modifies QMI CS1 configuration even when CS1 isn't used
+///
+/// Reference: pico-sdk `hardware_flash/flash.c` flash_save_hardware_state()
+#[cfg(feature = "_rp235x")]
+mod hardware_state {
+    use crate::pac;
+
+    /// Saved hardware state for restoration after flash operations.
+    pub(super) struct SavedState {
+        /// QSPI pad configuration (SCLK, SD0-SD3, SS)
+        qspi_pads: [u32; 6],
+        /// QMI M0 (CS0 - main flash) timing register
+        qmi_m0_timing: u32,
+        /// QMI M0 read command register
+        qmi_m0_rcmd: u32,
+        /// QMI M0 read format register
+        qmi_m0_rfmt: u32,
+        /// QMI M1 (CS1 - PSRAM if present) timing register
+        qmi_m1_timing: u32,
+        /// QMI M1 read command register
+        qmi_m1_rcmd: u32,
+        /// QMI M1 read format register
+        qmi_m1_rfmt: u32,
+    }
+
+    impl SavedState {
+        /// Save current QSPI pad and QMI configuration.
+        ///
+        /// Must be called before `connect_internal_flash()` which resets QSPI pads.
+        #[inline(never)]
+        #[unsafe(link_section = ".data.ram_func")]
+        pub(super) fn save() -> Self {
+            let pads_qspi = pac::PADS_QSPI;
+            let qmi = pac::QMI;
+
+            Self {
+                qspi_pads: [
+                    pads_qspi.gpio(0).read().0, // SCLK
+                    pads_qspi.gpio(1).read().0, // SD0
+                    pads_qspi.gpio(2).read().0, // SD1
+                    pads_qspi.gpio(3).read().0, // SD2
+                    pads_qspi.gpio(4).read().0, // SD3
+                    pads_qspi.gpio(5).read().0, // SS
+                ],
+                qmi_m0_timing: qmi.mem(0).timing().read().0,
+                qmi_m0_rcmd: qmi.mem(0).rcmd().read().0,
+                qmi_m0_rfmt: qmi.mem(0).rfmt().read().0,
+                qmi_m1_timing: qmi.mem(1).timing().read().0,
+                qmi_m1_rcmd: qmi.mem(1).rcmd().read().0,
+                qmi_m1_rfmt: qmi.mem(1).rfmt().read().0,
+            }
+        }
+
+        /// Restore QSPI pad and QMI configuration.
+        ///
+        /// Must be called after `flash_enter_cmd_xip()` (boot2) has restored XIP mode.
+        /// Includes a memory barrier to ensure all writes complete before subsequent
+        /// flash accesses.
+        #[inline(never)]
+        #[unsafe(link_section = ".data.ram_func")]
+        pub(super) unsafe fn restore(&self) {
+            let pads_qspi = pac::PADS_QSPI;
+            let qmi = pac::QMI;
+
+            // Restore QSPI pad state (drive strength, slew rate, pulls, etc.)
+            pads_qspi
+                .gpio(0)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[0]));
+            pads_qspi
+                .gpio(1)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[1]));
+            pads_qspi
+                .gpio(2)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[2]));
+            pads_qspi
+                .gpio(3)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[3]));
+            pads_qspi
+                .gpio(4)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[4]));
+            pads_qspi
+                .gpio(5)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[5]));
+
+            // Restore QMI M0 (CS0 - main flash) state
+            qmi.mem(0)
+                .timing()
+                .write_value(pac::qmi::regs::Timing(self.qmi_m0_timing));
+            qmi.mem(0)
+                .rcmd()
+                .write_value(pac::qmi::regs::Rcmd(self.qmi_m0_rcmd));
+            qmi.mem(0)
+                .rfmt()
+                .write_value(pac::qmi::regs::Rfmt(self.qmi_m0_rfmt));
+
+            // Restore QMI M1 (CS1 - PSRAM) state
+            qmi.mem(1)
+                .timing()
+                .write_value(pac::qmi::regs::Timing(self.qmi_m1_timing));
+            qmi.mem(1)
+                .rcmd()
+                .write_value(pac::qmi::regs::Rcmd(self.qmi_m1_rcmd));
+            qmi.mem(1)
+                .rfmt()
+                .write_value(pac::qmi::regs::Rfmt(self.qmi_m1_rfmt));
+
+            // Memory barrier to ensure all register writes complete before any
+            // subsequent flash accesses.
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            #[cfg(target_arch = "arm")]
+            core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
+        }
+    }
+}
+
 #[allow(dead_code)]
 mod ram_helpers {
     use super::*;
@@ -968,6 +1091,9 @@ mod ram_helpers {
     #[unsafe(link_section = ".data.ram_func")]
     #[cfg(feature = "_rp235x")]
     unsafe fn write_flash_inner(addr: u32, len: u32, data: Option<&[u8]>, ptrs: *const FlashFunctionPointers) {
+        // Save hardware state before flash operations modify it.
+        let saved_state = super::hardware_state::SavedState::save();
+
         let data = data.map(|d| d.as_ptr()).unwrap_or(core::ptr::null());
         ((*ptrs).connect_internal_flash)();
         ((*ptrs).flash_exit_xip)();
@@ -980,6 +1106,10 @@ mod ram_helpers {
         // RP2350 does not require CS IO force cleanup (QMI handles this differently).
         // Skip flash_flush_cache() and use targeted invalidation instead.
         ((*ptrs).flash_enter_cmd_xip)();
+
+        // Restore hardware state (QSPI pads, QMI M0/M1 configuration).
+        // This includes a memory barrier to ensure writes complete.
+        saved_state.restore();
 
         // Targeted cache invalidation for the modified flash range.
         // This runs after XIP is re-enabled, so it can execute from flash.
