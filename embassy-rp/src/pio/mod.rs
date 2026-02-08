@@ -213,13 +213,20 @@ impl<'a, 'd, PIO: Instance> Future for IrqFuture<'a, 'd, PIO> {
     fn poll(self: FuturePin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         //debug!("Poll {},{}", PIO::PIO_NO, SM);
 
+        // Register waker FIRST, before checking the flag. This prevents a
+        // TOCTOU race: if the flag is set between our check and the INTE
+        // enable below, the interrupt handler needs a registered waker to
+        // wake us. With the old ordering (check, register, enable), a flag
+        // set between check and register could fire the interrupt handler
+        // before the waker was registered, losing the wakeup.
+        PIO::wakers().irq()[self.irq_no as usize].register(cx.waker());
+
         // Check if IRQ flag is already set
         if PIO::PIO.irq().read().0 & (1 << self.irq_no) != 0 {
             PIO::PIO.irq().write(|m| m.0 = 1 << self.irq_no);
             return Poll::Ready(());
         }
 
-        PIO::wakers().irq()[self.irq_no as usize].register(cx.waker());
         PIO::PIO.irqs(0).inte().write_set(|m| {
             m.0 = SMIRQ_MASK << self.irq_no;
         });
@@ -385,6 +392,18 @@ impl<'d, PIO: Instance, const SM: usize> StateMachineRx<'d, PIO, SM> {
 
     fn dreq() -> crate::pac::dma::vals::TreqSel {
         crate::pac::dma::vals::TreqSel::from(PIO::PIO_NO * 8 + SM as u8 + 4)
+    }
+
+    /// Get the DREQ value for DMA transfers from this RX FIFO.
+    pub fn dma_dreq(&self) -> crate::pac::dma::vals::TreqSel {
+        Self::dreq()
+    }
+
+    /// Get the hardware address of this RX FIFO register.
+    ///
+    /// This is the address DMA should read from to pull data from this FIFO.
+    pub fn fifo_address(&self) -> u32 {
+        PIO::PIO.rxf(SM).as_ptr() as u32
     }
 
     /// Prepare DMA transfer from RX FIFO.

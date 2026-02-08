@@ -65,7 +65,7 @@ impl<'d> Channel<'d> {
     }
 
     /// Get the channel number.
-    fn number(&self) -> u8 {
+    pub fn number(&self) -> u8 {
         self.number
     }
 
@@ -271,6 +271,14 @@ impl<'a> Drop for Transfer<'a> {
             .modify(|m| m.set_chan_abort(1 << self.channel.number()));
         while p.ctrl_trig().read().busy() {}
     }
+}
+
+/// Get the waker for a DMA channel.
+///
+/// This allows external code to register with the DMA completion interrupt
+/// for a channel while using a custom completion predicate in `poll_fn`.
+pub fn channel_waker(ch_number: u8) -> &'static AtomicWaker {
+    &CHANNEL_WAKERS[ch_number as usize]
 }
 
 impl<'a> Unpin for Transfer<'a> {}
