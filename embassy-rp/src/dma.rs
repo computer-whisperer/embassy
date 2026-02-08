@@ -184,6 +184,14 @@ impl<'a, C: Channel> Drop for Transfer<'a, C> {
     }
 }
 
+/// Get the waker for a DMA channel.
+///
+/// This allows external code to register with the DMA completion interrupt
+/// for a channel while using a custom completion predicate in `poll_fn`.
+pub fn channel_waker(ch_number: u8) -> &'static AtomicWaker {
+    &CHANNEL_WAKERS[ch_number as usize]
+}
+
 impl<'a, C: Channel> Unpin for Transfer<'a, C> {}
 impl<'a, C: Channel> Future for Transfer<'a, C> {
     type Output = ();
