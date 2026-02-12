@@ -34,7 +34,7 @@ use ioctl::IoctlState;
 pub use crate::control::{
     AddMulticastAddressError, Control, JoinAuth, JoinError, JoinOptions, ScanOptions, ScanType, Scanner,
 };
-pub use crate::runner::Runner;
+pub use crate::runner::{FirmwareReader, Runner};
 pub use crate::sdio::{SdioBus, SdioBusCyw43};
 pub use crate::spi::{SpiBus, SpiBusCyw43};
 pub use crate::structs::BssInfo;
@@ -240,8 +240,8 @@ pub async fn new<'a, PWR, SPI>(
     state: &'a mut State,
     pwr: PWR,
     spi: SPI,
-    firmware: &Aligned<A4, [u8]>,
-    nvram: &Aligned<A4, [u8]>,
+    firmware: &mut impl FirmwareReader,
+    nvram: &[u8],
 ) -> (NetDriver<'a>, Control<'a>, Runner<'a, SpiBus<PWR, SPI>>)
 where
     PWR: OutputPin,
@@ -278,8 +278,8 @@ where
 pub async fn new_sdio<'a, SDIO>(
     state: &'a mut State,
     sdio: SDIO,
-    firmware: &Aligned<A4, [u8]>,
-    nvram: &Aligned<A4, [u8]>,
+    firmware: &mut impl FirmwareReader,
+    nvram: &[u8],
 ) -> (NetDriver<'a>, Control<'a>, Runner<'a, SdioBus<SDIO>>)
 where
     SDIO: SdioBusCyw43<64>,
@@ -317,9 +317,9 @@ pub async fn new_with_bluetooth<'a, PWR, SPI>(
     state: &'a mut State,
     pwr: PWR,
     spi: SPI,
-    wifi_firmware: &Aligned<A4, [u8]>,
-    bluetooth_firmware: &Aligned<A4, [u8]>,
-    nvram: &Aligned<A4, [u8]>,
+    wifi_firmware: &mut impl FirmwareReader,
+    bluetooth_firmware: &[u8],
+    nvram: &[u8],
 ) -> (
     NetDriver<'a>,
     bluetooth::BtDriver<'a>,

@@ -72,6 +72,25 @@ pub(crate) trait SealedBus {
 pub trait Bus: SealedBus {}
 impl<T: SealedBus> Bus for T {}
 
+/// Async reader for providing firmware data during CYW43 initialization.
+///
+/// This allows firmware to be streamed from a decompressor rather than
+/// requiring the entire blob in contiguous memory.
+pub trait FirmwareReader {
+    /// Read firmware data into `buf`. Returns the number of bytes read.
+    /// Returns 0 when all data has been consumed.
+    async fn read(&mut self, buf: &mut [u8]) -> usize;
+}
+
+impl FirmwareReader for &[u8] {
+    async fn read(&mut self, buf: &mut [u8]) -> usize {
+        let n = buf.len().min(self.len());
+        buf[..n].copy_from_slice(&self[..n]);
+        *self = &self[n..];
+        n
+    }
+}
+
 /// Driver communicating with the WiFi chip.
 pub struct Runner<'a, BUS> {
     ch: ch::Runner<'a, MTU>,
@@ -129,8 +148,8 @@ where
 
     pub(crate) async fn init(
         &mut self,
-        wifi_fw: &Aligned<A4, [u8]>,
-        nvram: &Aligned<A4, [u8]>,
+        wifi_fw: &mut impl FirmwareReader,
+        nvram: &[u8],
         bt_fw: Option<&[u8]>,
     ) -> Result<(), ()> {
         self.bus.init(bt_fw.is_some()).await;
@@ -260,7 +279,26 @@ where
         let ram_addr = CHIP.atcm_ram_base_address;
 
         debug!("loading fw");
-        self.bus.bp_write(ram_addr, wifi_fw).await;
+        let mut write_addr = ram_addr;
+        let mut chunk = [0u8; 512];
+        loop {
+            let mut filled = 0;
+            while filled < chunk.len() {
+                let n = wifi_fw.read(&mut chunk[filled..]).await;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            if filled == 0 {
+                break;
+            }
+            // Pad to 4-byte alignment (bp_write requires addr % 4 == 0)
+            let aligned = (filled + 3) & !3;
+            chunk[filled..aligned].fill(0);
+            self.bus.bp_write(write_addr, &chunk[..aligned]).await;
+            write_addr += aligned as u32;
+        }
 
         debug!("loading nvram");
         // Round up to 4 bytes.
