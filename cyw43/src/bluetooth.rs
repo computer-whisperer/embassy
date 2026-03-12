@@ -1,5 +1,7 @@
 use core::future::Future;
 use core::mem::MaybeUninit;
+#[cfg(feature = "bt-tx-repro-diag")]
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use bt_hci::transport::WithIndicator;
 use bt_hci::{ControllerToHostPacket, FromHciBytes, FromHciBytesError, HostToControllerPacket, PacketKind, WriteHci};
@@ -51,9 +53,66 @@ pub(crate) struct BtRunner<'d> {
     addr: u32,
     h2b_write_pointer: u32,
     b2h_read_pointer: u32,
+
+    #[cfg(feature = "bt-rx-byte-probe")]
+    probe_packets: u32,
+    #[cfg(feature = "bt-rx-byte-probe")]
+    probe_checked_o4: u32,
+    #[cfg(feature = "bt-rx-byte-probe")]
+    probe_mismatch_o4: u32,
+    #[cfg(feature = "bt-rx-byte-probe")]
+    probe_checked_o9: u32,
+    #[cfg(feature = "bt-rx-byte-probe")]
+    probe_mismatch_o9: u32,
+
+    #[cfg(feature = "bt-rx-sentinel-probe")]
+    sentinel_packets: u32,
+    #[cfg(feature = "bt-rx-sentinel-probe")]
+    sentinel_blocks: u32,
+    #[cfg(feature = "bt-rx-sentinel-probe")]
+    sentinel_mismatch: u32,
+    #[cfg(feature = "bt-rx-sentinel-probe")]
+    sentinel_carry: [u8; 15],
+    #[cfg(feature = "bt-rx-sentinel-probe")]
+    sentinel_carry_ring_off: [u32; 15],
+    #[cfg(feature = "bt-rx-sentinel-probe")]
+    sentinel_carry_len: u8,
+    #[cfg(feature = "bt-rx-sentinel-probe")]
+    sentinel_carry_handle: u16,
+    #[cfg(feature = "bt-rx-sentinel-probe")]
+    sentinel_carry_active: bool,
 }
 
 const BT_HCI_MTU: usize = 1024;
+
+#[cfg(feature = "bt-rx-sentinel-probe")]
+const SENTINEL_HEAD: [u8; 8] = *b"R4D_PING";
+#[cfg(feature = "bt-rx-sentinel-probe")]
+const SENTINEL_TAIL: [u8; 8] = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+#[cfg(any(feature = "bt-rx-sentinel-probe", feature = "bt-tx-repro-diag"))]
+const HCI_PACKET_TYPE_ACL: u8 = 0x02;
+#[cfg(feature = "bt-rx-sentinel-probe")]
+const ACL_PB_CONTINUING: u16 = 0x1;
+
+#[cfg(feature = "bt-tx-repro-diag")]
+const REPRO_MAGIC: [u8; 8] = *b"R4D_SPI!";
+#[cfg(feature = "bt-tx-repro-diag")]
+const REPRO_TEST_PACKET_LEN: usize = 220;
+#[cfg(feature = "bt-tx-repro-diag")]
+const REPRO_HEADER_LEN: usize = 16;
+
+#[cfg(feature = "bt-tx-repro-diag")]
+static TX_DIAG_DRIVER_CHECKED: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bt-tx-repro-diag")]
+static TX_DIAG_DRIVER_BAD: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bt-tx-repro-diag")]
+static TX_DIAG_RUNNER_CHECKED: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bt-tx-repro-diag")]
+static TX_DIAG_RUNNER_BAD: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bt-tx-readback-probe")]
+static TX_DIAG_READBACK_CHECKED: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bt-tx-readback-probe")]
+static TX_DIAG_READBACK_BAD: AtomicU32 = AtomicU32::new(0);
 
 /// Represents a packet of size MTU.
 pub(crate) struct BtPacketBuf {
@@ -93,6 +152,34 @@ pub(crate) fn new<'d>(state: &'d mut BtState) -> (BtRunner<'d>, BtDriver<'d>) {
             addr: 0,
             h2b_write_pointer: 0,
             b2h_read_pointer: 0,
+
+            #[cfg(feature = "bt-rx-byte-probe")]
+            probe_packets: 0,
+            #[cfg(feature = "bt-rx-byte-probe")]
+            probe_checked_o4: 0,
+            #[cfg(feature = "bt-rx-byte-probe")]
+            probe_mismatch_o4: 0,
+            #[cfg(feature = "bt-rx-byte-probe")]
+            probe_checked_o9: 0,
+            #[cfg(feature = "bt-rx-byte-probe")]
+            probe_mismatch_o9: 0,
+
+            #[cfg(feature = "bt-rx-sentinel-probe")]
+            sentinel_packets: 0,
+            #[cfg(feature = "bt-rx-sentinel-probe")]
+            sentinel_blocks: 0,
+            #[cfg(feature = "bt-rx-sentinel-probe")]
+            sentinel_mismatch: 0,
+            #[cfg(feature = "bt-rx-sentinel-probe")]
+            sentinel_carry: [0; 15],
+            #[cfg(feature = "bt-rx-sentinel-probe")]
+            sentinel_carry_ring_off: [0; 15],
+            #[cfg(feature = "bt-rx-sentinel-probe")]
+            sentinel_carry_len: 0,
+            #[cfg(feature = "bt-rx-sentinel-probe")]
+            sentinel_carry_handle: 0,
+            #[cfg(feature = "bt-rx-sentinel-probe")]
+            sentinel_carry_active: false,
         },
         BtDriver {
             rx: Mutex::new(rx_receiver),
@@ -162,6 +249,149 @@ pub(crate) fn read_firmware_patch_line(p_btfw_cb: &mut CybtFwCb, hfd: &mut HexFi
         }
     }
     0
+}
+
+#[cfg(feature = "bt-tx-repro-diag")]
+#[derive(Clone, Copy)]
+struct ReproDiag {
+    seq: u16,
+    mismatches: u16,
+    first_offset: u16,
+    first_expected: u8,
+    first_actual: u8,
+}
+
+#[cfg(feature = "bt-tx-repro-diag")]
+fn inspect_repro_hci_packet(packet: &[u8]) -> Option<ReproDiag> {
+    if packet.len() < 5 || packet[0] != HCI_PACKET_TYPE_ACL {
+        return None;
+    }
+
+    let acl_len = u16::from_le_bytes([packet[3], packet[4]]) as usize;
+    if packet.len() < 5 + acl_len {
+        return None;
+    }
+
+    inspect_repro_acl_payload(&packet[5..5 + acl_len])
+}
+
+#[cfg(feature = "bt-tx-repro-diag")]
+fn inspect_repro_acl_payload(acl_payload: &[u8]) -> Option<ReproDiag> {
+    if acl_payload.len() < 4 + 2 + REPRO_TEST_PACKET_LEN {
+        return None;
+    }
+
+    let l2cap_len = u16::from_le_bytes([acl_payload[0], acl_payload[1]]) as usize;
+    if l2cap_len < 2 + REPRO_TEST_PACKET_LEN || acl_payload.len() < 4 + l2cap_len {
+        return None;
+    }
+
+    let l2_payload = &acl_payload[4..4 + l2cap_len];
+    let sdu_len = u16::from_le_bytes([l2_payload[0], l2_payload[1]]) as usize;
+    if sdu_len != REPRO_TEST_PACKET_LEN || l2_payload.len() < 2 + sdu_len {
+        return None;
+    }
+
+    inspect_repro_payload(&l2_payload[2..2 + sdu_len])
+}
+
+#[cfg(feature = "bt-tx-repro-diag")]
+fn inspect_repro_payload(payload: &[u8]) -> Option<ReproDiag> {
+    if payload.len() != REPRO_TEST_PACKET_LEN || payload[..8] != REPRO_MAGIC {
+        return None;
+    }
+
+    let seq = u16::from_le_bytes([payload[8], payload[9]]);
+    let mut mismatches = 0u16;
+    let mut first_offset = 0u16;
+    let mut first_expected = 0u8;
+    let mut first_actual = 0u8;
+    let mut first_set = false;
+
+    for (offset, actual) in payload.iter().copied().enumerate() {
+        let expected = repro_expected_byte(offset, seq);
+        if actual != expected {
+            mismatches = mismatches.wrapping_add(1);
+            if !first_set {
+                first_set = true;
+                first_offset = offset as u16;
+                first_expected = expected;
+                first_actual = actual;
+            }
+        }
+    }
+
+    Some(ReproDiag {
+        seq,
+        mismatches,
+        first_offset,
+        first_expected,
+        first_actual,
+    })
+}
+
+#[cfg(feature = "bt-tx-repro-diag")]
+fn repro_expected_byte(offset: usize, seq: u16) -> u8 {
+    match offset {
+        0..=7 => REPRO_MAGIC[offset],
+        8..=9 => seq.to_le_bytes()[offset - 8],
+        10..=11 => (REPRO_TEST_PACKET_LEN as u16).to_le_bytes()[offset - 10],
+        12 => 0xA5 ^ (seq as u8),
+        13 => 0x5A ^ ((seq >> 8) as u8),
+        14 => 0x3C,
+        15 => 0xC3,
+        _ => (((offset - REPRO_HEADER_LEN) as u16).wrapping_add(seq) & 0xff) as u8,
+    }
+}
+
+#[cfg(feature = "bt-tx-repro-diag")]
+fn tx_diag_record_driver(diag: ReproDiag) {
+    let checked = TX_DIAG_DRIVER_CHECKED.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if diag.mismatches != 0 {
+        let bad = TX_DIAG_DRIVER_BAD.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        warn!(
+            "[txdiag bt-driver] seq={} off={} got={:02x} exp={:02x} xor={:02x} mismatches={} bad={}/{}",
+            diag.seq,
+            diag.first_offset,
+            diag.first_actual,
+            diag.first_expected,
+            diag.first_actual ^ diag.first_expected,
+            diag.mismatches,
+            bad,
+            checked
+        );
+    } else if checked % 1024 == 0 {
+        info!(
+            "[txdiag bt-driver] checked={} bad={}",
+            checked,
+            TX_DIAG_DRIVER_BAD.load(Ordering::Relaxed)
+        );
+    }
+}
+
+#[cfg(feature = "bt-tx-repro-diag")]
+fn tx_diag_record_runner(diag: ReproDiag) {
+    let checked = TX_DIAG_RUNNER_CHECKED.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if diag.mismatches != 0 {
+        let bad = TX_DIAG_RUNNER_BAD.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        warn!(
+            "[txdiag bt-runner] seq={} off={} got={:02x} exp={:02x} xor={:02x} mismatches={} bad={}/{}",
+            diag.seq,
+            diag.first_offset,
+            diag.first_actual,
+            diag.first_expected,
+            diag.first_actual ^ diag.first_expected,
+            diag.mismatches,
+            bad,
+            checked
+        );
+    } else if checked % 1024 == 0 {
+        info!(
+            "[txdiag bt-runner] checked={} bad={}",
+            checked,
+            TX_DIAG_RUNNER_BAD.load(Ordering::Relaxed)
+        );
+    }
 }
 
 impl<'a> BtRunner<'a> {
@@ -345,11 +575,18 @@ impl<'a> BtRunner<'a> {
 
         // NOTE(unwrap): we only call this when we do have a packet in the queue.
         let buf = self.tx_chan.try_receive().unwrap();
+        #[cfg(feature = "bt-tx-repro-diag")]
+        let repro_diag = inspect_repro_hci_packet(&buf.buf[..buf.len]);
+        #[cfg(feature = "bt-tx-repro-diag")]
+        if let Some(diag) = repro_diag {
+            tx_diag_record_runner(diag);
+        }
         debug!("HCI tx: {:02x}", crate::fmt::Bytes(&buf.buf[..buf.len]));
 
         let len = buf.len as u32 - 1; // len doesn't include hci type byte
         let rounded_len = round_up(len, 4);
         let total_len = 4 + rounded_len;
+        let ring_write_start = self.h2b_write_pointer;
 
         let read_pointer = bus.bp_read32(self.addr + BTSDIO_OFFSET_HOST2BT_OUT).await;
         let available = read_pointer.wrapping_sub(self.h2b_write_pointer + 4) % BTSDIO_FWBUF_SIZE;
@@ -390,6 +627,12 @@ impl<'a> BtRunner<'a> {
         }
         self.h2b_write_pointer = (self.h2b_write_pointer + payload.len() as u32) % BTSDIO_FWBUF_SIZE;
 
+        #[cfg(feature = "bt-tx-readback-probe")]
+        if let Some(diag) = repro_diag {
+            Self::tx_readback_probe(bus, self.addr, ring_write_start, &header, payload, diag)
+                .await;
+        }
+
         // Update pointer.
         bus.bp_write32(self.addr + BTSDIO_OFFSET_HOST2BT_IN, self.h2b_write_pointer)
             .await;
@@ -397,6 +640,84 @@ impl<'a> BtRunner<'a> {
         self.bt_toggle_intr(bus).await;
 
         self.tx_chan.receive_done();
+    }
+
+    #[cfg(feature = "bt-tx-readback-probe")]
+    async fn tx_readback_probe(
+        bus: &mut impl Bus,
+        addr: u32,
+        ring_write_start: u32,
+        header: &[u8; 4],
+        payload: &[u8],
+        diag: ReproDiag,
+    ) {
+        let total_len = 4 + payload.len();
+        if total_len > BT_HCI_MTU + 4 {
+            return;
+        }
+
+        let mut expected = [0u8; BT_HCI_MTU + 4];
+        expected[..4].copy_from_slice(header);
+        expected[4..total_len].copy_from_slice(payload);
+
+        let mut actual = [0u8; BT_HCI_MTU + 4];
+        let mut ptr = ring_write_start;
+        let mut copied = 0usize;
+        while copied < total_len {
+            let to_wrap = (BTSDIO_FWBUF_SIZE - ptr) as usize;
+            let n = core::cmp::min(total_len - copied, to_wrap);
+            let backplane_addr = addr + BTSDIO_OFFSET_HOST_WRITE_BUF + ptr;
+            bus.bp_read(backplane_addr, &mut actual[copied..copied + n]).await;
+            copied += n;
+            ptr = (ptr + n as u32) % BTSDIO_FWBUF_SIZE;
+        }
+
+        let checked = TX_DIAG_READBACK_CHECKED
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+
+        let mut mismatches = 0u16;
+        let mut first_offset = 0u16;
+        let mut first_expected = 0u8;
+        let mut first_actual = 0u8;
+        let mut first_set = false;
+        for offset in 0..total_len {
+            let exp = expected[offset];
+            let got = actual[offset];
+            if exp != got {
+                mismatches = mismatches.wrapping_add(1);
+                if !first_set {
+                    first_set = true;
+                    first_offset = offset as u16;
+                    first_expected = exp;
+                    first_actual = got;
+                }
+            }
+        }
+
+        if mismatches != 0 {
+            let bad = TX_DIAG_READBACK_BAD.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            let in_header = first_offset < 4;
+            let payload_off = first_offset.saturating_sub(4);
+            warn!(
+                "[txdiag bt-write-readback] seq={} off={} payload_off={} header={} got={:02x} exp={:02x} mismatches={} bad={}/{}",
+                diag.seq,
+                first_offset,
+                payload_off,
+                in_header,
+                first_actual,
+                first_expected,
+                mismatches,
+                bad,
+                checked
+            );
+        } else if checked % 1024 == 0 {
+            info!(
+                "[txdiag bt-write-readback] checked={} bad={}",
+                checked,
+                TX_DIAG_READBACK_BAD.load(Ordering::Relaxed)
+            );
+        }
     }
 
     async fn bt_has_work(&mut self, bus: &mut impl Bus) -> bool {
@@ -410,6 +731,65 @@ impl<'a> BtRunner<'a> {
             return true;
         }
         return false;
+    }
+
+    #[cfg(feature = "bt-rx-sentinel-probe")]
+    fn scan_sentinel_blocks(payload: &[u8]) -> (u32, u32, Option<(usize, [u8; 8])>) {
+        const BLOCK_LEN: usize = 16;
+        if payload.len() < BLOCK_LEN {
+            return (0, 0, None);
+        }
+
+        let mut hits = 0u32;
+        let mut mismatches = 0u32;
+        let mut first_mismatch: Option<(usize, [u8; 8])> = None;
+
+        for i in 0..=payload.len() - BLOCK_LEN {
+            if payload[i..i + 8] == SENTINEL_HEAD {
+                hits = hits.wrapping_add(1);
+                if payload[i + 8..i + 16] != SENTINEL_TAIL {
+                    mismatches = mismatches.wrapping_add(1);
+                    if first_mismatch.is_none() {
+                        let mut got_tail = [0u8; 8];
+                        got_tail.copy_from_slice(&payload[i + 8..i + 16]);
+                        first_mismatch = Some((i, got_tail));
+                    }
+                }
+            }
+        }
+
+        (hits, mismatches, first_mismatch)
+    }
+
+    #[cfg(feature = "bt-rx-byte-probe")]
+    async fn probe_bulk_vs_single_byte(
+        bus: &mut impl Bus,
+        bt_read_buf_addr: u32,
+        payload_start_ptr: u32,
+        payload: &[u8],
+        probe_offset: usize,
+    ) -> Option<bool> {
+        if payload.len() <= probe_offset {
+            return None;
+        }
+
+        let ring_off = (payload_start_ptr + probe_offset as u32) % BTSDIO_FWBUF_SIZE;
+        let addr = bt_read_buf_addr + ring_off;
+
+        let bulk = payload[probe_offset];
+        let single = bus.bp_read8(addr).await;
+
+        if bulk != single {
+            warn!(
+                "[bt-rx-byte-probe] bulk[{}]={:02x} single={:02x} ring_off=0x{:x}",
+                probe_offset,
+                bulk,
+                single,
+                ring_off
+            );
+            return Some(true);
+        }
+        Some(false)
     }
 
     pub(crate) async fn handle_irq(&mut self, bus: &mut impl Bus) {
@@ -438,21 +818,189 @@ impl<'a> BtRunner<'a> {
 
                 // Obtain a buf from the channel.
                 let buf = self.rx_chan.send().await;
+                #[cfg(any(feature = "bt-rx-byte-probe", feature = "bt-rx-sentinel-probe"))]
+                let bt_read_buf_addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF;
 
-                buf.buf[0] = header[3]; // hci packet type
+                let hci_packet_type = header[3];
+                buf.buf[0] = hci_packet_type; // hci packet type
                 let payload = &mut buf.buf[1..][..rounded_len as usize];
-                if self.b2h_read_pointer as usize + payload.len() > BTSDIO_FWBUF_SIZE as usize {
+                let payload_start_ptr = self.b2h_read_pointer;
+                if payload_start_ptr as usize + payload.len() > BTSDIO_FWBUF_SIZE as usize {
                     // wraparound
-                    let n = BTSDIO_FWBUF_SIZE - self.b2h_read_pointer;
-                    let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + self.b2h_read_pointer;
+                    let n = BTSDIO_FWBUF_SIZE - payload_start_ptr;
+                    let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + payload_start_ptr;
                     bus.bp_read(addr, &mut payload[..n as usize]).await;
                     let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF;
                     bus.bp_read(addr, &mut payload[n as usize..]).await;
                 } else {
                     // no wraparound
-                    let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + self.b2h_read_pointer;
+                    let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + payload_start_ptr;
                     bus.bp_read(addr, payload).await;
                 }
+                #[cfg(any(feature = "bt-rx-byte-probe", feature = "bt-rx-sentinel-probe"))]
+                let payload_valid = &payload[..len as usize];
+
+                #[cfg(feature = "bt-rx-sentinel-probe")]
+                {
+                    self.sentinel_packets = self.sentinel_packets.wrapping_add(1);
+                    // Only stitch across true ACL continuation fragments on the same handle.
+                    // This avoids false matches that include the next packet's ACL header bytes.
+                    if hci_packet_type == HCI_PACKET_TYPE_ACL && payload_valid.len() >= 4 {
+                        let acl_flags = u16::from_le_bytes([payload_valid[0], payload_valid[1]]);
+                        let handle = acl_flags & 0x0fff;
+                        let pb = (acl_flags >> 12) & 0x3;
+                        let is_cont = pb == ACL_PB_CONTINUING;
+                        let acl_len = u16::from_le_bytes([payload_valid[2], payload_valid[3]]) as usize;
+                        let acl_avail = payload_valid.len().saturating_sub(4);
+                        let acl_len = acl_len.min(acl_avail);
+                        let acl_data = &payload_valid[4..4 + acl_len];
+
+                        if !is_cont || !self.sentinel_carry_active || self.sentinel_carry_handle != handle {
+                            self.sentinel_carry_len = 0;
+                        }
+
+                        let carry_len = self.sentinel_carry_len as usize;
+                        let mut scan_buf = [0u8; BT_HCI_MTU + 15];
+                        scan_buf[..carry_len].copy_from_slice(&self.sentinel_carry[..carry_len]);
+                        let total_len = carry_len + acl_data.len();
+                        scan_buf[carry_len..total_len].copy_from_slice(acl_data);
+
+                        let scan_slice = &scan_buf[..total_len];
+                        let (hits, mismatches, first_mismatch) = Self::scan_sentinel_blocks(scan_slice);
+                        self.sentinel_blocks = self.sentinel_blocks.wrapping_add(hits);
+                        self.sentinel_mismatch = self.sentinel_mismatch.wrapping_add(mismatches);
+
+                        if let Some((offset, got_tail)) = first_mismatch {
+                            let cross_boundary = offset < carry_len;
+                            let acl_off = offset.saturating_sub(carry_len);
+                            let mut tail_idx = 0usize;
+                            while tail_idx < SENTINEL_TAIL.len()
+                                && got_tail[tail_idx] == SENTINEL_TAIL[tail_idx]
+                            {
+                                tail_idx += 1;
+                            }
+                            if tail_idx < SENTINEL_TAIL.len() {
+                                let scan_idx = offset + SENTINEL_HEAD.len() + tail_idx;
+                                let ring_off = if scan_idx < carry_len {
+                                    self.sentinel_carry_ring_off[scan_idx]
+                                } else {
+                                    let acl_idx = scan_idx - carry_len;
+                                    (payload_start_ptr + 4 + acl_idx as u32) % BTSDIO_FWBUF_SIZE
+                                };
+                                let bulk = got_tail[tail_idx];
+                                let single = bus.bp_read8(bt_read_buf_addr + ring_off).await;
+                                warn!(
+                                    "[bt-rx-sentinel-probe] acl_off={} cross={} tail_idx={} bulk={:02x} single={:02x} ring_off=0x{:x} got_tail={:02x} expected_tail={:02x}",
+                                    acl_off,
+                                    cross_boundary,
+                                    tail_idx,
+                                    bulk,
+                                    single,
+                                    ring_off,
+                                    crate::fmt::Bytes(&got_tail),
+                                    crate::fmt::Bytes(&SENTINEL_TAIL)
+                                );
+                            } else {
+                                warn!(
+                                    "[bt-rx-sentinel-probe] acl_off={} cross={} got_tail={:02x} expected_tail={:02x}",
+                                    acl_off,
+                                    cross_boundary,
+                                    crate::fmt::Bytes(&got_tail),
+                                    crate::fmt::Bytes(&SENTINEL_TAIL)
+                                );
+                            }
+                        }
+
+                        let new_carry_len = total_len.min(self.sentinel_carry.len());
+                        let carry_start = total_len - new_carry_len;
+                        for i in 0..new_carry_len {
+                            let src_idx = carry_start + i;
+                            self.sentinel_carry[i] = scan_slice[src_idx];
+                            self.sentinel_carry_ring_off[i] = if src_idx < carry_len {
+                                self.sentinel_carry_ring_off[src_idx]
+                            } else {
+                                let acl_idx = src_idx - carry_len;
+                                (payload_start_ptr + 4 + acl_idx as u32) % BTSDIO_FWBUF_SIZE
+                            };
+                        }
+                        self.sentinel_carry_len = new_carry_len as u8;
+                        self.sentinel_carry_handle = handle;
+                        self.sentinel_carry_active = true;
+                    } else {
+                        self.sentinel_carry_len = 0;
+                        self.sentinel_carry_active = false;
+                    }
+
+                    if self.sentinel_packets % 2048 == 0 {
+                        info!(
+                            "[bt-rx-sentinel-probe] pkts={} blocks={} mismatches={}",
+                            self.sentinel_packets,
+                            self.sentinel_blocks,
+                            self.sentinel_mismatch
+                        );
+                    }
+                }
+
+                #[cfg(feature = "bt-rx-byte-probe")]
+                {
+                    self.probe_packets = self.probe_packets.wrapping_add(1);
+                    const PROBE_SAMPLE_MASK: u32 = 0x3f; // sample 1/64 packets
+
+                    if (self.probe_packets & PROBE_SAMPLE_MASK) == 0 {
+                        // Candidate offsets for the dominant corruption position:
+                        // - 4: continuation byte 0 (if IPHC header is fully elided)
+                        // - 9: continuation byte 5 (if IPHC header is ~35 bytes)
+                        match Self::probe_bulk_vs_single_byte(
+                            bus,
+                            bt_read_buf_addr,
+                            payload_start_ptr,
+                            payload_valid,
+                            4,
+                        )
+                        .await
+                        {
+                            Some(true) => {
+                                self.probe_checked_o4 = self.probe_checked_o4.wrapping_add(1);
+                                self.probe_mismatch_o4 = self.probe_mismatch_o4.wrapping_add(1);
+                            }
+                            Some(false) => {
+                                self.probe_checked_o4 = self.probe_checked_o4.wrapping_add(1);
+                            }
+                            None => {}
+                        }
+
+                        match Self::probe_bulk_vs_single_byte(
+                            bus,
+                            bt_read_buf_addr,
+                            payload_start_ptr,
+                            payload_valid,
+                            9,
+                        )
+                        .await
+                        {
+                            Some(true) => {
+                                self.probe_checked_o9 = self.probe_checked_o9.wrapping_add(1);
+                                self.probe_mismatch_o9 = self.probe_mismatch_o9.wrapping_add(1);
+                            }
+                            Some(false) => {
+                                self.probe_checked_o9 = self.probe_checked_o9.wrapping_add(1);
+                            }
+                            None => {}
+                        }
+                    }
+
+                    if self.probe_packets % 2048 == 0 {
+                        info!(
+                            "[bt-rx-byte-probe] pkts={} sample=1/64 o4: checked={} mismatches={} o9: checked={} mismatches={}",
+                            self.probe_packets,
+                            self.probe_checked_o4,
+                            self.probe_mismatch_o4,
+                            self.probe_checked_o9,
+                            self.probe_mismatch_o9
+                        );
+                    }
+                }
+
                 self.b2h_read_pointer = (self.b2h_read_pointer + payload.len() as u32) % BTSDIO_FWBUF_SIZE;
                 bus.bp_write32(self.addr + BTSDIO_OFFSET_BT2HOST_OUT, self.b2h_read_pointer)
                     .await;
@@ -532,6 +1080,10 @@ impl<'d> bt_hci::transport::Transport for BtDriver<'d> {
                 .write_hci(&mut slice)
                 .map_err(|_| Error::Io(ErrorKind::Other))?;
             buf.len = buf_len - slice.len();
+            #[cfg(feature = "bt-tx-repro-diag")]
+            if let Some(diag) = inspect_repro_hci_packet(&buf.buf[..buf.len]) {
+                tx_diag_record_driver(diag);
+            }
             ch.send_done();
             Ok(())
         }
