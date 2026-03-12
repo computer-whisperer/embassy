@@ -17,6 +17,22 @@ bluetooth = ["dep:bt-hci", "dep:embedded-io-async"]
 # Fetch console logs from the WiFi firmware and forward them to `log` or `defmt`.
 firmware-logs = []
 
+# Diagnostic: compare one byte from bulk BT ring-buffer reads against a direct
+# single-byte backplane read at the same address. Helps localize RX corruption.
+bt-rx-byte-probe = []
+
+# Diagnostic: scan inbound HCI ACL payloads for a sentinel block and report
+# mismatches immediately (no extra bus reads).
+bt-rx-sentinel-probe = []
+
+# Diagnostic: validate deterministic BLE SPI repro payloads at two TX points:
+# bt-hci transport write and runner HCI write just before bus transfer.
+bt-tx-repro-diag = []
+
+# Diagnostic: after BT host writes packet bytes into CYW43 ring buffer, read
+# the same bytes back before publishing HOST2BT_IN and compare.
+bt-tx-readback-probe = ["bt-tx-repro-diag"]
+
 [dependencies]
 embassy-time = { version = "0.5.1", path = "../embassy-time"}
 embassy-sync = { version = "0.8.0", path = "../embassy-sync"}
