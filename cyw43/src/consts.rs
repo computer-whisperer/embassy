@@ -1,5 +1,11 @@
 #![allow(unused)]
 
+#[cfg(all(feature = "spi-resp-delay-2", feature = "spi-resp-delay-8"))]
+compile_error!("Select only one SPI response delay feature");
+
+#[cfg(all(feature = "backplane-max-transfer-16", feature = "backplane-max-transfer-32"))]
+compile_error!("Select only one backplane max transfer feature");
+
 pub(crate) const FUNC_BUS: u32 = 0;
 pub(crate) const FUNC_BACKPLANE: u32 = 1;
 pub(crate) const FUNC_WLAN: u32 = 2;
@@ -104,6 +110,13 @@ pub(crate) const BACKPLANE_WINDOW_SIZE: usize = 0x8000;
 pub(crate) const BACKPLANE_ADDRESS_MASK: u32 = 0x7FFF;
 pub(crate) const BACKPLANE_ADDRESS_32BIT_FLAG: u32 = 0x08000;
 pub(crate) const BACKPLANE_MAX_TRANSFER_SIZE: usize = 64;
+
+#[cfg(feature = "backplane-max-transfer-16")]
+pub(crate) const SPI_BACKPLANE_MAX_TRANSFER_SIZE: usize = 16;
+#[cfg(feature = "backplane-max-transfer-32")]
+pub(crate) const SPI_BACKPLANE_MAX_TRANSFER_SIZE: usize = 32;
+#[cfg(not(any(feature = "backplane-max-transfer-16", feature = "backplane-max-transfer-32")))]
+pub(crate) const SPI_BACKPLANE_MAX_TRANSFER_SIZE: usize = 64;
 pub(crate) const BLOCK_BUFFER_SIZE: usize = 1024;
 // Active Low Power (ALP) clock constants
 pub(crate) const BACKPLANE_ALP_AVAIL_REQ: u8 = 0x08;
@@ -175,6 +188,11 @@ pub(crate) const BTFW_HEX_LINE_TYPE_ABSOLUTE_32BIT_ADDRESS: u8 = 5;
 
 // Bluetooth constants.
 pub(crate) const SPI_RESP_DELAY_F1: u32 = 0x001d;
+#[cfg(feature = "spi-resp-delay-2")]
+pub(crate) const WHD_BUS_SPI_BACKPLANE_READ_PADD_SIZE: u8 = 2;
+#[cfg(feature = "spi-resp-delay-8")]
+pub(crate) const WHD_BUS_SPI_BACKPLANE_READ_PADD_SIZE: u8 = 8;
+#[cfg(not(any(feature = "spi-resp-delay-2", feature = "spi-resp-delay-8")))]
 pub(crate) const WHD_BUS_SPI_BACKPLANE_READ_PADD_SIZE: u8 = 4;
 
 pub(crate) const BT2WLAN_PWRUP_WAKE: u32 = 3;
@@ -189,6 +207,8 @@ pub(crate) const BTSDIO_REG_BT_AWAKE_BITMASK: u32 = 1 << 8;
 pub(crate) const BTSDIO_REG_WAKE_BT_BITMASK: u32 = 1 << 17;
 pub(crate) const BTSDIO_REG_SW_RDY_BITMASK: u32 = 1 << 24;
 pub(crate) const BTSDIO_REG_FW_RDY_BITMASK: u32 = 1 << 24;
+pub(crate) const BTSDIO_REG_HOST_CTRL_ALLOWED_BITMASK: u32 =
+    BTSDIO_REG_SW_RDY_BITMASK | BTSDIO_REG_WAKE_BT_BITMASK | BTSDIO_REG_DATA_VALID_BITMASK;
 
 pub(crate) const BTSDIO_FWBUF_SIZE: u32 = 0x1000;
 pub(crate) const BTSDIO_OFFSET_HOST_WRITE_BUF: u32 = 0;

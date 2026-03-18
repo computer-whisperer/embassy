@@ -25,6 +25,10 @@ bt-rx-byte-probe = []
 # mismatches immediately (no extra bus reads).
 bt-rx-sentinel-probe = []
 
+# Diagnostic: after reading BT2HOST payload bytes from CYW43 ring, immediately
+# reread the same bytes and compare before publishing BT2HOST_OUT.
+bt-rx-readback-probe = []
+
 # Diagnostic: validate deterministic BLE SPI repro payloads at two TX points:
 # bt-hci transport write and runner HCI write just before bus transfer.
 bt-tx-repro-diag = []
@@ -32,6 +36,35 @@ bt-tx-repro-diag = []
 # Diagnostic: after BT host writes packet bytes into CYW43 ring buffer, read
 # the same bytes back before publishing HOST2BT_IN and compare.
 bt-tx-readback-probe = ["bt-tx-repro-diag"]
+
+# Diagnostic: mirror Pico cybt_shared_bus guardrails for HOST_CTRL bitmask/cache
+# handling plus strict BT ring pointer/window assertions.
+bt-sharedbus-strict-checks = []
+
+# Diagnostic: periodically sample HOST_CTRL from hardware and compare against
+# driver cache without asserting, to detect runtime drift with low overhead.
+bt-hostctrl-cache-sample = []
+
+# SPI tuning knobs for BLE-SPI corruption triage.
+spi-no-high-speed = []
+spi-resp-delay-2 = []
+spi-resp-delay-8 = []
+backplane-max-transfer-16 = []
+backplane-max-transfer-32 = []
+spi-wlan-write-guard = []
+spi-irq-extended-handle = []
+
+# BT event-loop mode for BLE-SPI corruption triage.
+bt-event-irq-wait = []
+
+# BT shared-ring timing/ordering probes for BLE-SPI corruption triage.
+bt-ring-intr-set = []
+bt-ring-pointer-stable-read = []
+bt-ring-pointer-write-readback = []
+bt-ring-tx-publish-delay-10us = []
+bt-ring-tx-intr-delay-10us = []
+bt-ring-rx-out-delay-10us = []
+bt-ring-rx-intr-delay-10us = []
 
 [dependencies]
 embassy-time = { version = "0.5.0", path = "../embassy-time"}
