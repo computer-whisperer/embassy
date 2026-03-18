@@ -41,6 +41,14 @@ pub(crate) enum BusType {
     Sdio,
 }
 
+#[cfg(feature = "spi-irq-extended-handle")]
+const SPI_IRQ_CLEARABLE_BITS: u16 = IRQ_DATA_UNAVAILABLE
+    | IRQ_F2_F3_FIFO_RD_UNDERFLOW
+    | IRQ_F2_F3_FIFO_WR_OVERFLOW
+    | IRQ_COMMAND_ERROR
+    | IRQ_DATA_ERROR
+    | IRQ_F1_OVERFLOW;
+
 pub(crate) trait SealedBus {
     const TYPE: BusType;
 
@@ -343,15 +351,22 @@ where
 
             BusType::Spi => {
                 // Set up the interrupt mask and enable interrupts
+                let mut spi_irq_enable = IRQ_F2_F3_FIFO_RD_UNDERFLOW
+                    | IRQ_F2_F3_FIFO_WR_OVERFLOW
+                    | IRQ_COMMAND_ERROR
+                    | IRQ_DATA_ERROR
+                    | IRQ_F2_PACKET_AVAILABLE
+                    | IRQ_F1_OVERFLOW;
                 if bt_fw.is_some() {
                     debug!("bluetooth setup interrupt mask");
                     self.bus
                         .bp_write32(CHIP.sdiod_core_base_address + SDIO_INT_HOST_MASK, I_HMB_FC_CHANGE)
                         .await;
+                    spi_irq_enable |= IRQ_F1_INTR;
                 }
 
                 self.bus
-                    .write16(FUNC_BUS, REG_BUS_INTERRUPT_ENABLE, IRQ_F2_PACKET_AVAILABLE)
+                    .write16(FUNC_BUS, REG_BUS_INTERRUPT_ENABLE, spi_irq_enable)
                     .await;
 
                 // "Lower F2 Watermark to avoid DMA Hang in F2 when SD Clock is stopped."
@@ -511,10 +526,11 @@ where
                 #[cfg(not(feature = "bluetooth"))]
                 let bt_tx = core::future::pending::<()>();
 
-                // interrupts aren't working yet for bluetooth. Do busy-polling instead.
-                // Note for this to work `ev` has to go last in the `select()`. It prefers
-                // first futures if they're ready, so other select branches don't get starved.`
-                #[cfg(feature = "bluetooth")]
+                // Keep `ev` last in `select4`: when ready, earlier branches (ioctl/wifi/bt tx)
+                // still get serviced first.
+                #[cfg(all(feature = "bluetooth", feature = "bt-event-irq-wait"))]
+                let ev = self.bus.wait_for_event();
+                #[cfg(all(feature = "bluetooth", not(feature = "bt-event-irq-wait")))]
                 let ev = core::future::ready(());
                 #[cfg(not(feature = "bluetooth"))]
                 let ev = self.bus.wait_for_event();
@@ -590,11 +606,8 @@ where
                     Either4::Fourth(()) => {
                         self.handle_irq(&mut buf).await;
 
-                        // If we do busy-polling, make sure to yield.
-                        // `handle_irq` will only do a 32bit read if there's no work to do, which is really fast.
-                        // Depending on optimization level, it is possible that the 32-bit read finishes on
-                        // first poll, so it never yields and we starve all other tasks.
-                        #[cfg(feature = "bluetooth")]
+                        // If BT mode is busy-polling, yield to avoid starving other tasks.
+                        #[cfg(all(feature = "bluetooth", not(feature = "bt-event-irq-wait")))]
                         embassy_futures::yield_now().await;
                     }
                 }
@@ -660,6 +673,33 @@ where
                     self.check_status(buf).await;
                 }
 
+                #[cfg(feature = "spi-irq-extended-handle")]
+                {
+                    // Extended handling for the error/overflow bits included in our SPI
+                    // interrupt mask. These are write-1-to-clear status bits.
+                    let clearable = irq & SPI_IRQ_CLEARABLE_BITS;
+                    if clearable != 0 {
+                        let severe = clearable
+                            & (IRQ_F2_F3_FIFO_RD_UNDERFLOW
+                                | IRQ_F2_F3_FIFO_WR_OVERFLOW
+                                | IRQ_COMMAND_ERROR
+                                | IRQ_DATA_ERROR
+                                | IRQ_F1_OVERFLOW);
+                        if severe != 0 {
+                            warn!("spi irq error bits set: 0x{:04x}", clearable);
+                        } else {
+                            trace!("spi irq clearable bits: 0x{:04x}", clearable);
+                        }
+                        self.bus.write16(FUNC_BUS, REG_BUS_INTERRUPT, clearable).await;
+                    }
+
+                    let aux = irq & (IRQ_F1_INTR | IRQ_F2_INTR | IRQ_F3_INTR | IRQ_F3_PACKET_AVAILABLE);
+                    if aux != 0 {
+                        trace!("spi irq aux bits: 0x{:04x}", aux);
+                    }
+                }
+
+                #[cfg(not(feature = "spi-irq-extended-handle"))]
                 if irq & IRQ_DATA_UNAVAILABLE != 0 {
                     // this seems to be ignorable with no ill effects.
                     trace!("IRQ DATA_UNAVAILABLE, clearing...");

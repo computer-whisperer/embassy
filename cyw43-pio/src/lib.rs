@@ -185,13 +185,38 @@ where
         let mut pin_io: embassy_rp::pio::Pin<PIO> = common.make_pio_pin(dio);
         pin_io.set_pull(Pull::None);
         pin_io.set_schmitt(true);
+        #[cfg(not(feature = "spi-input-sync-bypass-off"))]
         pin_io.set_input_sync_bypass(true);
+        #[cfg(feature = "spi-input-sync-bypass-off")]
+        pin_io.set_input_sync_bypass(false);
+
+        #[cfg(not(feature = "spi-low-drive-slow-slew"))]
         pin_io.set_drive_strength(Drive::_12mA);
+        #[cfg(feature = "spi-low-drive-slow-slew")]
+        pin_io.set_drive_strength(Drive::_2mA);
+
+        #[cfg(not(feature = "spi-low-drive-slow-slew"))]
         pin_io.set_slew_rate(SlewRate::Fast);
+        #[cfg(feature = "spi-low-drive-slow-slew")]
+        pin_io.set_slew_rate(SlewRate::Slow);
 
         let mut pin_clk = common.make_pio_pin(clk);
+        #[cfg(not(feature = "spi-low-drive-slow-slew"))]
         pin_clk.set_drive_strength(Drive::_12mA);
+        #[cfg(feature = "spi-low-drive-slow-slew")]
+        pin_clk.set_drive_strength(Drive::_2mA);
+
+        #[cfg(not(feature = "spi-low-drive-slow-slew"))]
         pin_clk.set_slew_rate(SlewRate::Fast);
+        #[cfg(feature = "spi-low-drive-slow-slew")]
+        pin_clk.set_slew_rate(SlewRate::Slow);
+
+        #[cfg(feature = "defmt")]
+        defmt::trace!(
+            "pio io knobs: input_sync_bypass={} low_drive_slow_slew={}",
+            !cfg!(feature = "spi-input-sync-bypass-off"),
+            cfg!(feature = "spi-low-drive-slow-slew")
+        );
 
         let mut cfg = Config::default();
         cfg.use_program(&loaded_program, &[&pin_clk]);

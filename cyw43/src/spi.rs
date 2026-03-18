@@ -37,6 +37,13 @@ pub struct SpiBus<PWR, SPI> {
     status: u32,
 }
 
+#[cfg(feature = "spi-wlan-write-guard")]
+const WLAN_WRITE_MAX_ATTEMPTS: usize = 4;
+#[cfg(feature = "spi-wlan-write-guard")]
+const WLAN_WRITE_READY_POLLS: usize = 64;
+#[cfg(feature = "spi-wlan-write-guard")]
+const SDPCM_HEADER_LEN_OFFSET: usize = 7;
+
 impl<PWR, SPI> SpiBus<PWR, SPI>
 where
     PWR: OutputPin,
@@ -144,6 +151,78 @@ where
 
         self.status = self.spi.cmd_write(&buf).await;
     }
+
+    #[cfg(feature = "spi-wlan-write-guard")]
+    async fn wait_f2_ready_for_wlan_write(&mut self) -> bool {
+        for _ in 0..WLAN_WRITE_READY_POLLS {
+            if self.read32(FUNC_BUS, REG_BUS_STATUS).await & STATUS_F2_RX_READY != 0 {
+                return true;
+            }
+            yield_now().await;
+        }
+        false
+    }
+
+    #[cfg(feature = "spi-wlan-write-guard")]
+    async fn clear_wlan_write_error_bits(&mut self, status: u32) {
+        let mut clear = 0u16;
+        if status & STATUS_DATA_NOT_AVAILABLE != 0 {
+            clear |= IRQ_DATA_UNAVAILABLE;
+        }
+        if status & STATUS_UNDERFLOW != 0 {
+            clear |= IRQ_F2_F3_FIFO_RD_UNDERFLOW;
+        }
+        if status & STATUS_OVERFLOW != 0 {
+            clear |= IRQ_F2_F3_FIFO_WR_OVERFLOW;
+        }
+        if status & STATUS_HOST_CMD_DATA_ERR != 0 {
+            clear |= IRQ_COMMAND_ERROR | IRQ_DATA_ERROR;
+        }
+        if clear != 0 {
+            self.write8(FUNC_BUS, REG_BUS_INTERRUPT, clear as u8).await;
+        }
+    }
+
+    #[cfg(feature = "spi-wlan-write-guard")]
+    fn validate_wlan_write_sdpcm(buf: &[u8]) -> bool {
+        if buf.len() < 12 {
+            warn!("spi wlan_write: short frame len={}", buf.len());
+            return false;
+        }
+
+        let sdpcm_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+        let sdpcm_len_inv = u16::from_le_bytes([buf[2], buf[3]]);
+        if sdpcm_len as u16 != !sdpcm_len_inv {
+            warn!(
+                "spi wlan_write: sdpcm len/inv mismatch len=0x{:04x} len_inv=0x{:04x}",
+                sdpcm_len as u16,
+                sdpcm_len_inv
+            );
+            return false;
+        }
+
+        // Writes are 4-byte rounded for the SPI command. Header len reflects actual frame len.
+        if sdpcm_len > buf.len() {
+            warn!(
+                "spi wlan_write: sdpcm len {} exceeds write len {}",
+                sdpcm_len,
+                buf.len()
+            );
+            return false;
+        }
+
+        let sdpcm_header_len = buf[SDPCM_HEADER_LEN_OFFSET] as usize;
+        if sdpcm_header_len < 12 || sdpcm_header_len > sdpcm_len {
+            warn!(
+                "spi wlan_write: invalid header_length={} for sdpcm len={}",
+                sdpcm_header_len,
+                sdpcm_len
+            );
+            return false;
+        }
+
+        true
+    }
 }
 
 impl<PWR, SPI> SealedBus for SpiBus<PWR, SPI>
@@ -182,16 +261,31 @@ where
         // 32-bit word length, little endian (which is the default endianess).
         // TODO: C library is uint32_t val = WORD_LENGTH_32 | HIGH_SPEED_MODE| ENDIAN_BIG | INTERRUPT_POLARITY_HIGH | WAKE_UP | 0x4 << (8 * SPI_RESPONSE_DELAY) | INTR_WITH_STATUS << (8 * SPI_STATUS_ENABLE);
         trace!("write REG_BUS_CTRL");
+        trace!(
+            "spi knobs: high_speed={} resp_delay={} bp_max_xfer={}",
+            cfg!(not(feature = "spi-no-high-speed")),
+            WHD_BUS_SPI_BACKPLANE_READ_PADD_SIZE,
+            SPI_BACKPLANE_MAX_TRANSFER_SIZE
+        );
+        #[cfg(not(feature = "spi-no-high-speed"))]
+        let bus_ctrl = WORD_LENGTH_32
+            | HIGH_SPEED
+            | INTERRUPT_POLARITY_HIGH
+            | WAKE_UP
+            | (WHD_BUS_SPI_BACKPLANE_READ_PADD_SIZE as u32) << (8 * REG_BUS_RESPONSE_DELAY)
+            | STATUS_ENABLE << (8 * REG_BUS_STATUS_ENABLE)
+            | INTR_WITH_STATUS << (8 * REG_BUS_STATUS_ENABLE);
+        #[cfg(feature = "spi-no-high-speed")]
+        let bus_ctrl = WORD_LENGTH_32
+            | INTERRUPT_POLARITY_HIGH
+            | WAKE_UP
+            | (WHD_BUS_SPI_BACKPLANE_READ_PADD_SIZE as u32) << (8 * REG_BUS_RESPONSE_DELAY)
+            | STATUS_ENABLE << (8 * REG_BUS_STATUS_ENABLE)
+            | INTR_WITH_STATUS << (8 * REG_BUS_STATUS_ENABLE);
         self.write32_swapped(
             FUNC_BUS,
             REG_BUS_CTRL,
-            WORD_LENGTH_32
-                | HIGH_SPEED
-                | INTERRUPT_POLARITY_HIGH
-                | WAKE_UP
-                | 0x4 << (8 * REG_BUS_RESPONSE_DELAY)
-                | STATUS_ENABLE << (8 * REG_BUS_STATUS_ENABLE)
-                | INTR_WITH_STATUS << (8 * REG_BUS_STATUS_ENABLE),
+            bus_ctrl,
         )
         .await;
 
@@ -251,6 +345,14 @@ where
     }
 
     async fn wlan_write(&mut self, buf: &Aligned<A4, [u8]>) {
+        #[cfg(feature = "spi-wlan-write-guard")]
+        let buf8 = &buf[..];
+
+        #[cfg(feature = "spi-wlan-write-guard")]
+        if !Self::validate_wlan_write_sdpcm(buf8) {
+            return;
+        }
+
         let buf = slice32_ref(buf);
         let cmd = cmd_word(WRITE, INC_ADDR, FUNC_WLAN, 0, buf.len() as u32 * 4);
         //TODO try to remove copy?
@@ -258,7 +360,49 @@ where
         cmd_buf[0] = cmd;
         cmd_buf[1..][..buf.len()].copy_from_slice(buf);
 
-        self.status = self.spi.cmd_write(&cmd_buf[..buf.len() + 1]).await;
+        #[cfg(feature = "spi-wlan-write-guard")]
+        {
+            for attempt in 0..WLAN_WRITE_MAX_ATTEMPTS {
+                if !self.wait_f2_ready_for_wlan_write().await {
+                    warn!(
+                        "spi wlan_write: f2 not ready before write (attempt={}/{})",
+                        attempt + 1,
+                        WLAN_WRITE_MAX_ATTEMPTS
+                    );
+                    continue;
+                }
+
+                self.status = self.spi.cmd_write(&cmd_buf[..buf.len() + 1]).await;
+                let bad_bits = self.status
+                    & (STATUS_DATA_NOT_AVAILABLE
+                        | STATUS_UNDERFLOW
+                        | STATUS_OVERFLOW
+                        | STATUS_HOST_CMD_DATA_ERR);
+                if bad_bits == 0 {
+                    return;
+                }
+
+                warn!(
+                    "spi wlan_write: status error=0x{:08x} (attempt={}/{})",
+                    self.status,
+                    attempt + 1,
+                    WLAN_WRITE_MAX_ATTEMPTS
+                );
+                self.clear_wlan_write_error_bits(self.status).await;
+                yield_now().await;
+            }
+
+            warn!(
+                "spi wlan_write: exhausted retries, last_status=0x{:08x}",
+                self.status
+            );
+            return;
+        }
+
+        #[cfg(not(feature = "spi-wlan-write-guard"))]
+        {
+            self.status = self.spi.cmd_write(&cmd_buf[..buf.len() + 1]).await;
+        }
     }
 
     #[allow(unused)]
@@ -272,14 +416,14 @@ where
         assert!(addr % 4 == 0);
 
         // Backplane read buffer has one extra word for the response delay.
-        let mut buf = [0u32; BACKPLANE_MAX_TRANSFER_SIZE / 4 + 1];
+        let mut buf = [0u32; SPI_BACKPLANE_MAX_TRANSFER_SIZE / 4 + 1];
 
         while !data.is_empty() {
             // Ensure transfer doesn't cross a window boundary.
             let window_offs = addr & BACKPLANE_ADDRESS_MASK;
             let window_remaining = BACKPLANE_WINDOW_SIZE - window_offs as usize;
 
-            let len = data.len().min(BACKPLANE_MAX_TRANSFER_SIZE).min(window_remaining);
+            let len = data.len().min(SPI_BACKPLANE_MAX_TRANSFER_SIZE).min(window_remaining);
 
             self.backplane_set_window(addr).await;
 
@@ -306,14 +450,14 @@ where
         // To simplify, enforce 4-align for now.
         assert!(addr % 4 == 0);
 
-        let mut buf = [0u32; BACKPLANE_MAX_TRANSFER_SIZE / 4 + 1];
+        let mut buf = [0u32; SPI_BACKPLANE_MAX_TRANSFER_SIZE / 4 + 1];
 
         while !data.is_empty() {
             // Ensure transfer doesn't cross a window boundary.
             let window_offs = addr & BACKPLANE_ADDRESS_MASK;
             let window_remaining = BACKPLANE_WINDOW_SIZE - window_offs as usize;
 
-            let len = data.len().min(BACKPLANE_MAX_TRANSFER_SIZE).min(window_remaining);
+            let len = data.len().min(SPI_BACKPLANE_MAX_TRANSFER_SIZE).min(window_remaining);
             slice8_mut(&mut buf[1..])[..len].copy_from_slice(&data[..len]);
 
             self.backplane_set_window(addr).await;

@@ -53,6 +53,11 @@ pub(crate) struct BtRunner<'d> {
     addr: u32,
     h2b_write_pointer: u32,
     b2h_read_pointer: u32,
+    host_ctrl_cache_reg: u32,
+    #[cfg(feature = "bt-hostctrl-cache-sample")]
+    host_ctrl_sample_ops: u32,
+    #[cfg(feature = "bt-hostctrl-cache-sample")]
+    host_ctrl_sample_mismatch: u32,
 
     #[cfg(feature = "bt-rx-byte-probe")]
     probe_packets: u32,
@@ -64,6 +69,15 @@ pub(crate) struct BtRunner<'d> {
     probe_checked_o9: u32,
     #[cfg(feature = "bt-rx-byte-probe")]
     probe_mismatch_o9: u32,
+
+    #[cfg(feature = "bt-rx-readback-probe")]
+    rx_readback_packets: u32,
+    #[cfg(feature = "bt-rx-readback-probe")]
+    rx_readback_sampled: u32,
+    #[cfg(feature = "bt-rx-readback-probe")]
+    rx_readback_mismatch_packets: u32,
+    #[cfg(feature = "bt-rx-readback-probe")]
+    rx_readback_mismatch_bytes: u32,
 
     #[cfg(feature = "bt-rx-sentinel-probe")]
     sentinel_packets: u32,
@@ -89,17 +103,32 @@ const BT_HCI_MTU: usize = 1024;
 const SENTINEL_HEAD: [u8; 8] = *b"R4D_PING";
 #[cfg(feature = "bt-rx-sentinel-probe")]
 const SENTINEL_TAIL: [u8; 8] = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
-#[cfg(any(feature = "bt-rx-sentinel-probe", feature = "bt-tx-repro-diag"))]
+#[cfg(any(
+    feature = "bt-rx-sentinel-probe",
+    feature = "bt-tx-repro-diag",
+    feature = "bt-rx-readback-probe"
+))]
 const HCI_PACKET_TYPE_ACL: u8 = 0x02;
 #[cfg(feature = "bt-rx-sentinel-probe")]
 const ACL_PB_CONTINUING: u16 = 0x1;
 
-#[cfg(feature = "bt-tx-repro-diag")]
+#[cfg(any(feature = "bt-tx-repro-diag", feature = "bt-rx-readback-probe"))]
 const REPRO_MAGIC: [u8; 8] = *b"R4D_SPI!";
-#[cfg(feature = "bt-tx-repro-diag")]
+#[cfg(any(feature = "bt-tx-repro-diag", feature = "bt-rx-readback-probe"))]
 const REPRO_TEST_PACKET_LEN: usize = 220;
 #[cfg(feature = "bt-tx-repro-diag")]
 const REPRO_HEADER_LEN: usize = 16;
+
+#[cfg(feature = "bt-ring-tx-publish-delay-10us")]
+const BT_RING_TX_PUBLISH_DELAY_US: u64 = 10;
+#[cfg(feature = "bt-ring-tx-intr-delay-10us")]
+const BT_RING_TX_INTR_DELAY_US: u64 = 10;
+#[cfg(feature = "bt-ring-rx-out-delay-10us")]
+const BT_RING_RX_OUT_DELAY_US: u64 = 10;
+#[cfg(feature = "bt-ring-rx-intr-delay-10us")]
+const BT_RING_RX_INTR_DELAY_US: u64 = 10;
+#[cfg(feature = "bt-hostctrl-cache-sample")]
+const HOST_CTRL_SAMPLE_EVERY_OPS: u32 = 1024;
 
 #[cfg(feature = "bt-tx-repro-diag")]
 static TX_DIAG_DRIVER_CHECKED: AtomicU32 = AtomicU32::new(0);
@@ -152,6 +181,11 @@ pub(crate) fn new<'d>(state: &'d mut BtState) -> (BtRunner<'d>, BtDriver<'d>) {
             addr: 0,
             h2b_write_pointer: 0,
             b2h_read_pointer: 0,
+            host_ctrl_cache_reg: 0,
+            #[cfg(feature = "bt-hostctrl-cache-sample")]
+            host_ctrl_sample_ops: 0,
+            #[cfg(feature = "bt-hostctrl-cache-sample")]
+            host_ctrl_sample_mismatch: 0,
 
             #[cfg(feature = "bt-rx-byte-probe")]
             probe_packets: 0,
@@ -163,6 +197,15 @@ pub(crate) fn new<'d>(state: &'d mut BtState) -> (BtRunner<'d>, BtDriver<'d>) {
             probe_checked_o9: 0,
             #[cfg(feature = "bt-rx-byte-probe")]
             probe_mismatch_o9: 0,
+
+            #[cfg(feature = "bt-rx-readback-probe")]
+            rx_readback_packets: 0,
+            #[cfg(feature = "bt-rx-readback-probe")]
+            rx_readback_sampled: 0,
+            #[cfg(feature = "bt-rx-readback-probe")]
+            rx_readback_mismatch_packets: 0,
+            #[cfg(feature = "bt-rx-readback-probe")]
+            rx_readback_mismatch_bytes: 0,
 
             #[cfg(feature = "bt-rx-sentinel-probe")]
             sentinel_packets: 0,
@@ -403,6 +446,196 @@ fn tx_diag_record_runner(diag: ReproDiag) {
 }
 
 impl<'a> BtRunner<'a> {
+    #[cfg(feature = "bt-sharedbus-strict-checks")]
+    fn assert_host_ctrl_bits(value: u32) {
+        assert!(value & !BTSDIO_REG_HOST_CTRL_ALLOWED_BITMASK == 0);
+    }
+
+    #[cfg(feature = "bt-sharedbus-strict-checks")]
+    fn assert_ring_pointer_value(value: u32) {
+        assert!(value < BTSDIO_FWBUF_SIZE);
+        assert!(value % 4 == 0);
+    }
+
+    #[cfg(feature = "bt-sharedbus-strict-checks")]
+    fn assert_ring_span(offset: u32, len: usize) {
+        assert!(offset < BTSDIO_FWBUF_SIZE);
+        assert!(offset as usize + len <= BTSDIO_FWBUF_SIZE as usize);
+    }
+
+    async fn host_ctrl_sync_from_hw(&mut self, bus: &mut impl Bus) {
+        let value = bus.bp_read32(HOST_CTRL_REG_ADDR).await;
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        Self::assert_host_ctrl_bits(value);
+        self.host_ctrl_cache_reg = value;
+    }
+
+    #[cfg(feature = "bt-sharedbus-strict-checks")]
+    async fn host_ctrl_assert_hw_matches_cache(&mut self, bus: &mut impl Bus) {
+        let value = bus.bp_read32(HOST_CTRL_REG_ADDR).await;
+        Self::assert_host_ctrl_bits(value);
+        assert!(value == self.host_ctrl_cache_reg);
+    }
+
+    #[cfg(feature = "bt-hostctrl-cache-sample")]
+    async fn host_ctrl_sample_hw(&mut self, bus: &mut impl Bus, phase: &str) {
+        self.host_ctrl_sample_ops = self.host_ctrl_sample_ops.wrapping_add(1);
+        if self.host_ctrl_sample_ops % HOST_CTRL_SAMPLE_EVERY_OPS != 0 {
+            return;
+        }
+
+        let value = bus.bp_read32(HOST_CTRL_REG_ADDR).await;
+        if value & !BTSDIO_REG_HOST_CTRL_ALLOWED_BITMASK != 0 {
+            warn!(
+                "host_ctrl sample invalid bits phase={} op={} hw=0x{:08x} cache=0x{:08x}",
+                phase, self.host_ctrl_sample_ops, value, self.host_ctrl_cache_reg
+            );
+        }
+
+        if value != self.host_ctrl_cache_reg {
+            self.host_ctrl_sample_mismatch = self.host_ctrl_sample_mismatch.wrapping_add(1);
+            warn!(
+                "host_ctrl sample mismatch phase={} op={} hw=0x{:08x} cache=0x{:08x} mismatches={}",
+                phase,
+                self.host_ctrl_sample_ops,
+                value,
+                self.host_ctrl_cache_reg,
+                self.host_ctrl_sample_mismatch
+            );
+        } else if (self.host_ctrl_sample_ops / HOST_CTRL_SAMPLE_EVERY_OPS) % 64 == 0 {
+            info!(
+                "host_ctrl sample ok samples={} mismatches={}",
+                self.host_ctrl_sample_ops / HOST_CTRL_SAMPLE_EVERY_OPS,
+                self.host_ctrl_sample_mismatch
+            );
+        }
+    }
+
+    async fn host_ctrl_read(&mut self, bus: &mut impl Bus) -> u32 {
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        Self::assert_host_ctrl_bits(self.host_ctrl_cache_reg);
+        #[cfg(feature = "bt-hostctrl-cache-sample")]
+        self.host_ctrl_sample_hw(bus, "read").await;
+        #[cfg(not(feature = "bt-hostctrl-cache-sample"))]
+        let _ = bus;
+
+        self.host_ctrl_cache_reg
+    }
+
+    async fn host_ctrl_write(&mut self, bus: &mut impl Bus, value: u32) {
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        Self::assert_host_ctrl_bits(value);
+
+        bus.bp_write32(HOST_CTRL_REG_ADDR, value).await;
+        self.host_ctrl_cache_reg = value;
+        #[cfg(feature = "bt-hostctrl-cache-sample")]
+        self.host_ctrl_sample_hw(bus, "write").await;
+    }
+
+    async fn h2b_ring_write(bus: &mut impl Bus, bt_addr: u32, ring_off: u32, data: &[u8]) {
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        Self::assert_ring_span(ring_off, data.len());
+
+        let addr = bt_addr + BTSDIO_OFFSET_HOST_WRITE_BUF + ring_off;
+        bus.bp_write(addr, data).await;
+    }
+
+    #[cfg(feature = "bt-tx-readback-probe")]
+    async fn h2b_ring_read(bus: &mut impl Bus, bt_addr: u32, ring_off: u32, data: &mut [u8]) {
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        Self::assert_ring_span(ring_off, data.len());
+
+        let addr = bt_addr + BTSDIO_OFFSET_HOST_WRITE_BUF + ring_off;
+        bus.bp_read(addr, data).await;
+    }
+
+    async fn b2h_ring_read(bus: &mut impl Bus, bt_addr: u32, ring_off: u32, data: &mut [u8]) {
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        Self::assert_ring_span(ring_off, data.len());
+
+        let addr = bt_addr + BTSDIO_OFFSET_HOST_READ_BUF + ring_off;
+        bus.bp_read(addr, data).await;
+    }
+
+    async fn read_ring_pointer(bus: &mut impl Bus, bt_addr: u32, pointer_off: u32) -> u32 {
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        {
+            assert!(pointer_off == BTSDIO_OFFSET_HOST2BT_OUT || pointer_off == BTSDIO_OFFSET_BT2HOST_IN);
+        }
+
+        let value = bus.bp_read32(bt_addr + pointer_off).await;
+
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        Self::assert_ring_pointer_value(value);
+
+        value
+    }
+
+    async fn write_ring_pointer(bus: &mut impl Bus, bt_addr: u32, pointer_off: u32, value: u32) {
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        {
+            assert!(pointer_off == BTSDIO_OFFSET_HOST2BT_IN || pointer_off == BTSDIO_OFFSET_BT2HOST_OUT);
+            Self::assert_ring_pointer_value(value);
+        }
+
+        bus.bp_write32(bt_addr + pointer_off, value).await;
+    }
+
+    #[cfg(feature = "bt-ring-pointer-stable-read")]
+    async fn read_ring_pointer_maybe_stable(bus: &mut impl Bus, bt_addr: u32, pointer_off: u32) -> u32 {
+        let first = Self::read_ring_pointer(bus, bt_addr, pointer_off).await;
+        let second = Self::read_ring_pointer(bus, bt_addr, pointer_off).await;
+        if first != second {
+            trace!(
+                "bt ring pointer unstable off=0x{:x} first=0x{:x} second=0x{:x}",
+                pointer_off,
+                first,
+                second
+            );
+        }
+        second
+    }
+
+    #[cfg(not(feature = "bt-ring-pointer-stable-read"))]
+    async fn read_ring_pointer_maybe_stable(bus: &mut impl Bus, bt_addr: u32, pointer_off: u32) -> u32 {
+        Self::read_ring_pointer(bus, bt_addr, pointer_off).await
+    }
+
+    async fn write_ring_pointer_maybe_verify(bus: &mut impl Bus, bt_addr: u32, pointer_off: u32, value: u32) {
+        Self::write_ring_pointer(bus, bt_addr, pointer_off, value).await;
+
+        #[cfg(feature = "bt-ring-pointer-write-readback")]
+        {
+            let addr = bt_addr + pointer_off;
+            for _ in 0..4 {
+                let got = bus.bp_read32(addr).await;
+                #[cfg(feature = "bt-sharedbus-strict-checks")]
+                Self::assert_ring_pointer_value(got);
+                if got == value {
+                    return;
+                }
+                Timer::after(Duration::from_micros(5)).await;
+            }
+            warn!(
+                "bt ring pointer write/readback mismatch off=0x{:x} value=0x{:x}",
+                pointer_off,
+                value
+            );
+        }
+    }
+
+    async fn bt_signal_intr(&mut self, bus: &mut impl Bus) {
+        #[cfg(feature = "bt-ring-intr-set")]
+        {
+            self.bt_set_intr(bus).await;
+        }
+
+        #[cfg(not(feature = "bt-ring-intr-set"))]
+        {
+            self.bt_toggle_intr(bus).await;
+        }
+    }
+
     pub(crate) async fn init_bluetooth(&mut self, bus: &mut impl Bus, firmware: &[u8]) {
         trace!("init_bluetooth");
         bus.bp_write32(CHIP.bluetooth_base_address + BT2WLAN_PWRUP_ADDR, BT2WLAN_PWRUP_WAKE)
@@ -412,8 +645,9 @@ impl<'a> BtRunner<'a> {
         self.wait_bt_ready(bus).await;
         self.init_bt_buffers(bus).await;
         self.wait_bt_awake(bus).await;
+        self.host_ctrl_sync_from_hw(bus).await;
         self.bt_set_host_ready(bus).await;
-        self.bt_toggle_intr(bus).await;
+        self.bt_signal_intr(bus).await;
     }
 
     pub(crate) async fn upload_bluetooth_firmware(&mut self, bus: &mut impl Bus, firmware: &[u8]) {
@@ -524,37 +758,55 @@ impl<'a> BtRunner<'a> {
 
     pub(crate) async fn bt_set_host_ready(&mut self, bus: &mut impl Bus) {
         trace!("bt_set_host_ready");
-        let old_val = bus.bp_read32(HOST_CTRL_REG_ADDR).await;
-        // TODO: do we need to swap endianness on this read?
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        self.host_ctrl_assert_hw_matches_cache(bus).await;
+        let old_val = self.host_ctrl_read(bus).await;
         let new_val = old_val | BTSDIO_REG_SW_RDY_BITMASK;
-        bus.bp_write32(HOST_CTRL_REG_ADDR, new_val).await;
+        self.host_ctrl_write(bus, new_val).await;
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        self.host_ctrl_assert_hw_matches_cache(bus).await;
     }
 
     // TODO: use this
     #[allow(dead_code)]
     pub(crate) async fn bt_set_awake(&mut self, bus: &mut impl Bus, awake: bool) {
         trace!("bt_set_awake");
-        let old_val = bus.bp_read32(HOST_CTRL_REG_ADDR).await;
-        // TODO: do we need to swap endianness on this read?
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        self.host_ctrl_assert_hw_matches_cache(bus).await;
+        let old_val = self.host_ctrl_read(bus).await;
         let new_val = if awake {
             old_val | BTSDIO_REG_WAKE_BT_BITMASK
         } else {
             old_val & !BTSDIO_REG_WAKE_BT_BITMASK
         };
-        bus.bp_write32(HOST_CTRL_REG_ADDR, new_val).await;
+        self.host_ctrl_write(bus, new_val).await;
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        self.host_ctrl_assert_hw_matches_cache(bus).await;
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn bt_toggle_intr(&mut self, bus: &mut impl Bus) {
-        bt_toggle_intr(bus).await;
+        trace!("bt_toggle_intr");
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        self.host_ctrl_assert_hw_matches_cache(bus).await;
+        let old_val = self.host_ctrl_read(bus).await;
+        let new_val = old_val ^ BTSDIO_REG_DATA_VALID_BITMASK;
+        self.host_ctrl_write(bus, new_val).await;
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        self.host_ctrl_assert_hw_matches_cache(bus).await;
     }
 
     // TODO: use this
     #[allow(dead_code)]
     pub(crate) async fn bt_set_intr(&mut self, bus: &mut impl Bus) {
         trace!("bt_set_intr");
-        let old_val = bus.bp_read32(HOST_CTRL_REG_ADDR).await;
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        self.host_ctrl_assert_hw_matches_cache(bus).await;
+        let old_val = self.host_ctrl_read(bus).await;
         let new_val = old_val | BTSDIO_REG_DATA_VALID_BITMASK;
-        bus.bp_write32(HOST_CTRL_REG_ADDR, new_val).await;
+        self.host_ctrl_write(bus, new_val).await;
+        #[cfg(feature = "bt-sharedbus-strict-checks")]
+        self.host_ctrl_assert_hw_matches_cache(bus).await;
     }
 
     pub(crate) async fn init_bt_buffers(&mut self, bus: &mut impl Bus) {
@@ -590,9 +842,10 @@ impl<'a> BtRunner<'a> {
         let len = buf.len as u32 - 1; // len doesn't include hci type byte
         let rounded_len = round_up(len, 4);
         let total_len = 4 + rounded_len;
+        #[cfg(feature = "bt-tx-readback-probe")]
         let ring_write_start = self.h2b_write_pointer;
 
-        let read_pointer = bus.bp_read32(self.addr + BTSDIO_OFFSET_HOST2BT_OUT).await;
+        let read_pointer = Self::read_ring_pointer_maybe_stable(bus, self.addr, BTSDIO_OFFSET_HOST2BT_OUT).await;
         let available = read_pointer.wrapping_sub(self.h2b_write_pointer + 4) % BTSDIO_FWBUF_SIZE;
         if available < total_len {
             warn!(
@@ -611,8 +864,7 @@ impl<'a> BtRunner<'a> {
         header[3] = buf.buf[0]; // HCI type byte
 
         // Write header
-        let addr = self.addr + BTSDIO_OFFSET_HOST_WRITE_BUF + self.h2b_write_pointer;
-        bus.bp_write(addr, &header).await;
+        Self::h2b_ring_write(bus, self.addr, self.h2b_write_pointer, &header).await;
         self.h2b_write_pointer = (self.h2b_write_pointer + 4) % BTSDIO_FWBUF_SIZE;
 
         // Write payload.
@@ -620,27 +872,32 @@ impl<'a> BtRunner<'a> {
         if self.h2b_write_pointer as usize + payload.len() > BTSDIO_FWBUF_SIZE as usize {
             // wraparound
             let n = BTSDIO_FWBUF_SIZE - self.h2b_write_pointer;
-            let addr = self.addr + BTSDIO_OFFSET_HOST_WRITE_BUF + self.h2b_write_pointer;
-            bus.bp_write(addr, &payload[..n as usize]).await;
-            let addr = self.addr + BTSDIO_OFFSET_HOST_WRITE_BUF;
-            bus.bp_write(addr, &payload[n as usize..]).await;
+            Self::h2b_ring_write(bus, self.addr, self.h2b_write_pointer, &payload[..n as usize])
+                .await;
+            Self::h2b_ring_write(bus, self.addr, 0, &payload[n as usize..]).await;
         } else {
             // no wraparound
-            let addr = self.addr + BTSDIO_OFFSET_HOST_WRITE_BUF + self.h2b_write_pointer;
-            bus.bp_write(addr, payload).await;
+            Self::h2b_ring_write(bus, self.addr, self.h2b_write_pointer, payload).await;
         }
         self.h2b_write_pointer = (self.h2b_write_pointer + payload.len() as u32) % BTSDIO_FWBUF_SIZE;
 
         #[cfg(feature = "bt-tx-readback-probe")]
         if let Some(diag) = repro_diag {
-            Self::tx_readback_probe(bus, self.addr, ring_write_start, &header, payload, diag)
-                .await;
+            Self::tx_readback_probe(bus, self.addr, ring_write_start, &header, payload, diag).await;
         }
 
         // Update pointer.
-        bus.bp_write32(self.addr + BTSDIO_OFFSET_HOST2BT_IN, self.h2b_write_pointer)
-            .await;
+        #[cfg(feature = "bt-ring-tx-publish-delay-10us")]
+        Timer::after(Duration::from_micros(BT_RING_TX_PUBLISH_DELAY_US)).await;
+        Self::write_ring_pointer_maybe_verify(bus, self.addr, BTSDIO_OFFSET_HOST2BT_IN, self.h2b_write_pointer).await;
 
+        #[cfg(feature = "bt-ring-tx-intr-delay-10us")]
+        Timer::after(Duration::from_micros(BT_RING_TX_INTR_DELAY_US)).await;
+        // Free-fn form (not self.bt_signal_intr): `buf` holds a &mut borrow of
+        // self via tx_chan that lives until receive_done() below, so we can't
+        // take a second &mut self here. The free fn toggles DATA_VALID through
+        // `bus` only. (Diag commit used self.bt_signal_intr against the 0.6.0
+        // API where this borrow didn't exist; ported to 0.7.0 accordingly.)
         bt_toggle_intr(bus).await;
 
         buf.receive_done();
@@ -649,7 +906,7 @@ impl<'a> BtRunner<'a> {
     #[cfg(feature = "bt-tx-readback-probe")]
     async fn tx_readback_probe(
         bus: &mut impl Bus,
-        addr: u32,
+        bt_addr: u32,
         ring_write_start: u32,
         header: &[u8; 4],
         payload: &[u8],
@@ -670,8 +927,7 @@ impl<'a> BtRunner<'a> {
         while copied < total_len {
             let to_wrap = (BTSDIO_FWBUF_SIZE - ptr) as usize;
             let n = core::cmp::min(total_len - copied, to_wrap);
-            let backplane_addr = addr + BTSDIO_OFFSET_HOST_WRITE_BUF + ptr;
-            bus.bp_read(backplane_addr, &mut actual[copied..copied + n]).await;
+            Self::h2b_ring_read(bus, bt_addr, ptr, &mut actual[copied..copied + n]).await;
             copied += n;
             ptr = (ptr + n as u32) % BTSDIO_FWBUF_SIZE;
         }
@@ -796,11 +1052,103 @@ impl<'a> BtRunner<'a> {
         Some(false)
     }
 
+    #[cfg(feature = "bt-rx-readback-probe")]
+    async fn probe_rx_payload_readback(
+        bus: &mut impl Bus,
+        bt_addr: u32,
+        payload_start_ptr: u32,
+        payload: &[u8],
+    ) -> Option<(u16, u8, u8, u16, u32)> {
+        let mut ptr = payload_start_ptr;
+        let mut compared = 0usize;
+        let mut scratch = [0u8; 64];
+
+        let mut mismatches = 0u16;
+        let mut first_offset = 0u16;
+        let mut first_expected = 0u8;
+        let mut first_actual = 0u8;
+        let mut first_ring_off = 0u32;
+        let mut first_set = false;
+
+        while compared < payload.len() {
+            let to_wrap = (BTSDIO_FWBUF_SIZE - ptr) as usize;
+            let n = core::cmp::min(core::cmp::min(payload.len() - compared, to_wrap), scratch.len());
+            Self::b2h_ring_read(bus, bt_addr, ptr, &mut scratch[..n]).await;
+
+            for i in 0..n {
+                let actual = scratch[i];
+                let expected = payload[compared + i];
+                if actual != expected {
+                    mismatches = mismatches.wrapping_add(1);
+                    if !first_set {
+                        first_set = true;
+                        first_offset = (compared + i) as u16;
+                        first_expected = expected;
+                        first_actual = actual;
+                        first_ring_off = (ptr + i as u32) % BTSDIO_FWBUF_SIZE;
+                    }
+                }
+            }
+
+            compared += n;
+            ptr = (ptr + n as u32) % BTSDIO_FWBUF_SIZE;
+        }
+
+        if mismatches == 0 {
+            None
+        } else {
+            Some((first_offset, first_expected, first_actual, mismatches, first_ring_off))
+        }
+    }
+
+    #[cfg(feature = "bt-rx-readback-probe")]
+    fn probe_rx_packet_meta(hci_packet_type: u8, payload_valid: &[u8]) -> (u16, u8, u16, u32) {
+        let mut acl_handle = 0xffff;
+        let mut acl_pb = 0xff;
+        let mut l2cap_cid = 0xffff;
+        let mut repro_seq = u32::MAX;
+
+        if hci_packet_type != HCI_PACKET_TYPE_ACL || payload_valid.len() < 4 {
+            return (acl_handle, acl_pb, l2cap_cid, repro_seq);
+        }
+
+        let acl_flags = u16::from_le_bytes([payload_valid[0], payload_valid[1]]);
+        acl_handle = acl_flags & 0x0fff;
+        acl_pb = ((acl_flags >> 12) & 0x3) as u8;
+
+        let acl_len_decl = u16::from_le_bytes([payload_valid[2], payload_valid[3]]) as usize;
+        let acl_len_avail = payload_valid.len().saturating_sub(4);
+        let acl_len = acl_len_decl.min(acl_len_avail);
+        if acl_len < 4 {
+            return (acl_handle, acl_pb, l2cap_cid, repro_seq);
+        }
+
+        let acl_payload = &payload_valid[4..4 + acl_len];
+        let l2cap_len = u16::from_le_bytes([acl_payload[0], acl_payload[1]]) as usize;
+        l2cap_cid = u16::from_le_bytes([acl_payload[2], acl_payload[3]]);
+        if acl_payload.len() < 4 + l2cap_len || l2cap_len < 2 {
+            return (acl_handle, acl_pb, l2cap_cid, repro_seq);
+        }
+
+        let l2cap_payload = &acl_payload[4..4 + l2cap_len];
+        let sdu_len = u16::from_le_bytes([l2cap_payload[0], l2cap_payload[1]]) as usize;
+        if sdu_len != REPRO_TEST_PACKET_LEN || l2cap_payload.len() < 2 + sdu_len {
+            return (acl_handle, acl_pb, l2cap_cid, repro_seq);
+        }
+
+        let sdu = &l2cap_payload[2..2 + sdu_len];
+        if sdu.len() == REPRO_TEST_PACKET_LEN && sdu[..8] == REPRO_MAGIC {
+            repro_seq = u16::from_le_bytes([sdu[8], sdu[9]]) as u32;
+        }
+
+        (acl_handle, acl_pb, l2cap_cid, repro_seq)
+    }
+
     pub(crate) async fn handle_irq(&mut self, bus: &mut impl Bus) {
         if self.bt_has_work(bus).await {
             loop {
                 // Check if we have data.
-                let write_pointer = bus.bp_read32(self.addr + BTSDIO_OFFSET_BT2HOST_IN).await;
+                let write_pointer = Self::read_ring_pointer_maybe_stable(bus, self.addr, BTSDIO_OFFSET_BT2HOST_IN).await;
                 let available = write_pointer.wrapping_sub(self.b2h_read_pointer) % BTSDIO_FWBUF_SIZE;
                 if available == 0 {
                     break;
@@ -808,8 +1156,7 @@ impl<'a> BtRunner<'a> {
 
                 // read header
                 let mut header = [0u8; 4];
-                let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + self.b2h_read_pointer;
-                bus.bp_read(addr, &mut header).await;
+                Self::b2h_ring_read(bus, self.addr, self.b2h_read_pointer, &mut header).await;
 
                 // calc length
                 let len = header[0] as u32 | ((header[1]) as u32) << 8 | ((header[2]) as u32) << 16;
@@ -822,7 +1169,11 @@ impl<'a> BtRunner<'a> {
 
                 // Obtain a buf from the channel.
                 let mut buf = self.rx_chan.send().await;
-                #[cfg(any(feature = "bt-rx-byte-probe", feature = "bt-rx-sentinel-probe"))]
+                #[cfg(any(
+                    feature = "bt-rx-byte-probe",
+                    feature = "bt-rx-sentinel-probe",
+                    feature = "bt-rx-readback-probe"
+                ))]
                 let bt_read_buf_addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF;
 
                 let hci_packet_type = header[3];
@@ -832,17 +1183,69 @@ impl<'a> BtRunner<'a> {
                 if payload_start_ptr as usize + payload.len() > BTSDIO_FWBUF_SIZE as usize {
                     // wraparound
                     let n = BTSDIO_FWBUF_SIZE - payload_start_ptr;
-                    let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + payload_start_ptr;
-                    bus.bp_read(addr, &mut payload[..n as usize]).await;
-                    let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF;
-                    bus.bp_read(addr, &mut payload[n as usize..]).await;
+                    Self::b2h_ring_read(bus, self.addr, payload_start_ptr, &mut payload[..n as usize])
+                        .await;
+                    Self::b2h_ring_read(bus, self.addr, 0, &mut payload[n as usize..]).await;
                 } else {
                     // no wraparound
-                    let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + payload_start_ptr;
-                    bus.bp_read(addr, payload).await;
+                    Self::b2h_ring_read(bus, self.addr, payload_start_ptr, payload).await;
                 }
-                #[cfg(any(feature = "bt-rx-byte-probe", feature = "bt-rx-sentinel-probe"))]
+                #[cfg(any(
+                    feature = "bt-rx-byte-probe",
+                    feature = "bt-rx-sentinel-probe",
+                    feature = "bt-rx-readback-probe"
+                ))]
                 let payload_valid = &payload[..len as usize];
+
+                #[cfg(feature = "bt-rx-readback-probe")]
+                {
+                    self.rx_readback_packets = self.rx_readback_packets.wrapping_add(1);
+                    const PROBE_SAMPLE_MASK: u32 = 0x1f; // sample 1/32 packets
+
+                    if (self.rx_readback_packets & PROBE_SAMPLE_MASK) == 0 {
+                        self.rx_readback_sampled = self.rx_readback_sampled.wrapping_add(1);
+                        if let Some((first_off, first_exp, first_got, mismatches, ring_off)) =
+                            Self::probe_rx_payload_readback(bus, self.addr, payload_start_ptr, payload).await
+                        {
+                            let (acl_handle, acl_pb, l2cap_cid, repro_seq) =
+                                Self::probe_rx_packet_meta(hci_packet_type, payload_valid);
+                            self.rx_readback_mismatch_packets = self.rx_readback_mismatch_packets.wrapping_add(1);
+                            self.rx_readback_mismatch_bytes =
+                                self.rx_readback_mismatch_bytes.wrapping_add(mismatches as u32);
+                            let single = bus.bp_read8(bt_read_buf_addr + ring_off).await;
+
+                            warn!(
+                                "[bt-rx-readback-probe] hci_type={} acl_handle={} pb={} cid=0x{:x} repro_seq={} len={} rounded={} off={} ring_off=0x{:x} got={:02x} exp={:02x} xor={:02x} single={:02x} mismatches={} bad={}/{}",
+                                hci_packet_type,
+                                acl_handle,
+                                acl_pb,
+                                l2cap_cid,
+                                repro_seq,
+                                len,
+                                rounded_len,
+                                first_off,
+                                ring_off,
+                                first_got,
+                                first_exp,
+                                first_got ^ first_exp,
+                                single,
+                                mismatches,
+                                self.rx_readback_mismatch_packets,
+                                self.rx_readback_sampled
+                            );
+                        }
+                    }
+
+                    if self.rx_readback_packets % 2048 == 0 {
+                        info!(
+                            "[bt-rx-readback-probe] pkts={} sample=1/32 sampled={} bad={} bad_bytes={}",
+                            self.rx_readback_packets,
+                            self.rx_readback_sampled,
+                            self.rx_readback_mismatch_packets,
+                            self.rx_readback_mismatch_bytes
+                        );
+                    }
+                }
 
                 #[cfg(feature = "bt-rx-sentinel-probe")]
                 {
@@ -1006,7 +1409,9 @@ impl<'a> BtRunner<'a> {
                 }
 
                 self.b2h_read_pointer = (self.b2h_read_pointer + payload.len() as u32) % BTSDIO_FWBUF_SIZE;
-                bus.bp_write32(self.addr + BTSDIO_OFFSET_BT2HOST_OUT, self.b2h_read_pointer)
+                #[cfg(feature = "bt-ring-rx-out-delay-10us")]
+                Timer::after(Duration::from_micros(BT_RING_RX_OUT_DELAY_US)).await;
+                Self::write_ring_pointer_maybe_verify(bus, self.addr, BTSDIO_OFFSET_BT2HOST_OUT, self.b2h_read_pointer)
                     .await;
 
                 buf.len = 1 + len as usize;
@@ -1014,7 +1419,9 @@ impl<'a> BtRunner<'a> {
 
                 buf.send_done();
 
-                self.bt_toggle_intr(bus).await;
+                #[cfg(feature = "bt-ring-rx-intr-delay-10us")]
+                Timer::after(Duration::from_micros(BT_RING_RX_INTR_DELAY_US)).await;
+                self.bt_signal_intr(bus).await;
             }
         }
     }

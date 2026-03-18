@@ -17,6 +17,8 @@ defmt = { version = "1.0.1", optional = true }
 
 [features]
 defmt = ["dep:defmt"]
+spi-input-sync-bypass-off = []
+spi-low-drive-slow-slew = []
 
 [package.metadata.embassy]
 build = [
