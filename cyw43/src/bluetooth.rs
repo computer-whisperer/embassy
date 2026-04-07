@@ -1,4 +1,3 @@
-use core::cell::RefCell;
 use core::future::Future;
 use core::mem::MaybeUninit;
 
@@ -6,6 +5,7 @@ use bt_hci::transport::WithIndicator;
 use bt_hci::{ControllerToHostPacket, FromHciBytes, FromHciBytesError, HostToControllerPacket, PacketKind, WriteHci};
 use embassy_futures::yield_now;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_sync::zerocopy_channel;
 use embassy_time::{Duration, Timer};
 use embedded_io_async::ErrorKind;
@@ -39,8 +39,8 @@ struct BtStateInnre<'d> {
 
 /// Bluetooth driver.
 pub struct BtDriver<'d> {
-    rx: RefCell<zerocopy_channel::Receiver<'d, NoopRawMutex, BtPacketBuf>>,
-    tx: RefCell<zerocopy_channel::Sender<'d, NoopRawMutex, BtPacketBuf>>,
+    rx: Mutex<NoopRawMutex, zerocopy_channel::Receiver<'d, NoopRawMutex, BtPacketBuf>>,
+    tx: Mutex<NoopRawMutex, zerocopy_channel::Sender<'d, NoopRawMutex, BtPacketBuf>>,
 }
 
 pub(crate) struct BtRunner<'d> {
@@ -95,8 +95,8 @@ pub(crate) fn new<'d>(state: &'d mut BtState) -> (BtRunner<'d>, BtDriver<'d>) {
             b2h_read_pointer: 0,
         },
         BtDriver {
-            rx: RefCell::new(rx_receiver),
-            tx: RefCell::new(tx_sender),
+            rx: Mutex::new(rx_receiver),
+            tx: Mutex::new(tx_sender),
         },
     )
 }
@@ -512,7 +512,7 @@ impl embedded_io_async::Error for Error {
 impl<'d> bt_hci::transport::Transport for BtDriver<'d> {
     fn read<'a>(&self, rx: &'a mut [u8]) -> impl Future<Output = Result<ControllerToHostPacket<'a>, Self::Error>> {
         async {
-            let ch = &mut *self.rx.borrow_mut();
+            let mut ch = self.rx.lock().await;
             let buf = ch.receive().await;
             let n = buf.len;
             assert!(n < rx.len());
@@ -528,7 +528,7 @@ impl<'d> bt_hci::transport::Transport for BtDriver<'d> {
     /// Write a complete HCI packet from the tx buffer
     fn write<T: HostToControllerPacket>(&self, val: &T) -> impl Future<Output = Result<(), Self::Error>> {
         async {
-            let ch = &mut *self.tx.borrow_mut();
+            let mut ch = self.tx.lock().await;
             let mut buf = ch.send().await;
             let buf_len = buf.buf.len();
             let mut slice = &mut buf.buf[..];
