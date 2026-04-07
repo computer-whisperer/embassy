@@ -16,7 +16,6 @@ use embassy_stm32_wpan::TlMbox;
 use embassy_stm32_wpan::mac::{Driver, DriverState, Runner};
 use embassy_stm32_wpan::sub::mm;
 use embassy_time::{Duration, Timer};
-use heapless::Vec;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -103,11 +102,9 @@ async fn main(spawner: Spawner) {
     // Init network stack
     let ipv6_addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc00a, 0x2ff);
 
-    let config = embassy_net::Config::ipv6_static(StaticConfigV6 {
-        address: Ipv6Cidr::new(ipv6_addr, 104),
-        gateway: None,
-        dns_servers: Vec::new(),
-    });
+    let mut v6_config = StaticConfigV6::new();
+    v6_config.push_address(Ipv6Cidr::new(ipv6_addr, 104));
+    let config = embassy_net::Config::ipv6_static(v6_config);
 
     let (stack, eth_runner) = embassy_net::new(driver, config, RESOURCES.init(StackResources::new()), seed);
 

@@ -122,12 +122,36 @@ pub struct StaticConfigV4 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct StaticConfigV6 {
-    /// IP address and subnet mask.
-    pub address: Ipv6Cidr,
+    /// IP addresses and subnet masks.
+    pub addresses: Vec<Ipv6Cidr, 3>,
     /// Default gateway.
     pub gateway: Option<Ipv6Address>,
     /// DNS servers.
     pub dns_servers: Vec<Ipv6Address, 3>,
+}
+
+#[cfg(feature = "proto-ipv6")]
+impl StaticConfigV6 {
+    /// Create a static IPv6 config with no addresses.
+    pub fn new() -> Self {
+        Self {
+            addresses: Vec::new(),
+            gateway: None,
+            dns_servers: Vec::new(),
+        }
+    }
+
+    /// Create a static IPv6 config with a single address.
+    pub fn single(address: Ipv6Cidr) -> Self {
+        let mut cfg = Self::new();
+        cfg.push_address(address);
+        cfg
+    }
+
+    /// Append an IPv6 address; returns false if capacity is exceeded.
+    pub fn push_address(&mut self, address: Ipv6Cidr) -> bool {
+        self.addresses.push(address).is_ok()
+    }
 }
 
 /// DHCP configuration.
@@ -790,11 +814,12 @@ impl Inner {
         #[cfg(feature = "proto-ipv6")]
         if let Some(config) = &self.static_v6 {
             debug!("IPv6: UP");
-            debug!("   IP address:      {:?}", config.address);
+            for addr in &config.addresses {
+                debug!("   IP address:      {:?}", addr);
+                unwrap!(addrs.push(IpCidr::Ipv6(*addr)).ok());
+            }
             debug!("   Default gateway: {:?}", config.gateway);
-
-            unwrap!(addrs.push(IpCidr::Ipv6(config.address)).ok());
-            gateway_v6 = config.gateway;
+            gateway_v6 = config.gateway.into();
             #[cfg(feature = "dns")]
             for s in &config.dns_servers {
                 debug!("   DNS server:      {:?}", s);
