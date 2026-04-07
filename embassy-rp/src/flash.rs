@@ -13,8 +13,43 @@ use embedded_storage::nor_flash::{
 use crate::peripherals::FLASH;
 use crate::{dma, interrupt, pac};
 
-/// Flash base address.
-pub const FLASH_BASE: *const u32 = 0x10000000 as _;
+/// Default flash base address (cached, with ATRANS on RP2350).
+pub const FLASH_BASE: u32 = 0x10000000;
+
+/// Uncached flash base address (with ATRANS on RP2350).
+///
+/// On RP2040: 0x13000000
+/// On RP2350: 0x14000000
+#[cfg(feature = "rp2040")]
+pub const FLASH_BASE_UNCACHED: u32 = 0x13000000;
+/// Uncached flash base address (with ATRANS on RP2350).
+///
+/// On RP2040: 0x13000000
+/// On RP2350: 0x14000000
+#[cfg(feature = "_rp235x")]
+pub const FLASH_BASE_UNCACHED: u32 = 0x14000000;
+
+/// Uncached, untranslated flash base address.
+///
+/// This address bypasses ATRANS on RP2350, providing direct access to physical
+/// flash addresses. Use this when you need to read from known flash offsets
+/// that should not be affected by address translation (e.g., when ATRANS has
+/// been configured by the bootrom to remap a partition).
+///
+/// On RP2040 this is the same as [`FLASH_BASE_UNCACHED`] since ATRANS does not exist.
+#[cfg(feature = "rp2040")]
+pub const FLASH_BASE_UNTRANSLATED: u32 = 0x13000000;
+
+/// Uncached, untranslated flash base address.
+///
+/// This address bypasses ATRANS on RP2350, providing direct access to physical
+/// flash addresses. Use this when you need to read from known flash offsets
+/// that should not be affected by address translation (e.g., when ATRANS has
+/// been configured by the bootrom to remap a partition).
+///
+/// On RP2040 this is the same as `FLASH_BASE_UNCACHED` since ATRANS does not exist.
+#[cfg(feature = "_rp235x")]
+pub const FLASH_BASE_UNTRANSLATED: u32 = 0x1C000000;
 
 /// Address for xip setup function set up by the 235x bootrom.
 #[cfg(feature = "_rp235x")]
@@ -100,38 +135,45 @@ impl<'a, 'd, T: Instance, const FLASH_SIZE: usize> Drop for BackgroundRead<'a, '
         // Errata RP2040-E8: Perform an uncached read to make sure there's not a transfer in
         // flight that might effect an address written to start a new transfer.  This stalls
         // until after any transfer is complete, so the address will not change anymore.
-        #[cfg(feature = "rp2040")]
-        const XIP_NOCACHE_NOALLOC_BASE: *const u32 = 0x13000000 as *const _;
-        #[cfg(feature = "_rp235x")]
-        const XIP_NOCACHE_NOALLOC_BASE: *const u32 = 0x14000000 as *const _;
         unsafe {
-            core::ptr::read_volatile(XIP_NOCACHE_NOALLOC_BASE);
+            core::ptr::read_volatile(FLASH_BASE_UNCACHED as *const u32);
         }
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 
 /// Flash driver.
-pub struct Flash<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> {
+///
+/// # Type Parameters
+///
+/// * `T` - Flash peripheral instance
+/// * `M` - Mode (Blocking or Async)
+/// * `FLASH_SIZE` - Total flash size in bytes
+/// * `READ_BASE` - Base address for read operations. Defaults to [`FLASH_BASE`] (0x10000000).
+///   Use [`FLASH_BASE_UNTRANSLATED`] (0x1C000000 on RP2350) to bypass ATRANS and read
+///   from physical flash addresses directly.
+pub struct Flash<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32 = FLASH_BASE> {
     dma: Option<dma::Channel<'d>>,
     phantom: PhantomData<(&'d mut T, M)>,
 }
 
-impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SIZE> {
+impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> Flash<'d, T, M, FLASH_SIZE, READ_BASE> {
     /// Blocking read.
     ///
     /// The offset and buffer must be aligned.
     ///
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// The actual address read from is `READ_BASE + offset`, where `READ_BASE` is
+    /// the const generic parameter (defaults to [`FLASH_BASE`]).
     pub fn blocking_read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Error> {
         trace!(
             "Reading from 0x{:x} to 0x{:x}",
-            FLASH_BASE as u32 + offset,
-            FLASH_BASE as u32 + offset + bytes.len() as u32
+            READ_BASE + offset,
+            READ_BASE + offset + bytes.len() as u32
         );
         check_read(self, offset, bytes.len())?;
 
-        let flash_data = unsafe { core::slice::from_raw_parts((FLASH_BASE as u32 + offset) as *const u8, bytes.len()) };
+        let flash_data = unsafe { core::slice::from_raw_parts((READ_BASE + offset) as *const u8, bytes.len()) };
 
         bytes.copy_from_slice(flash_data);
         Ok(())
@@ -145,13 +187,14 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
     /// Blocking erase.
     ///
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// Erase operations always use physical flash offsets (not affected by READ_BASE).
     pub fn blocking_erase(&mut self, from: u32, to: u32) -> Result<(), Error> {
         check_erase(self, from, to)?;
 
         trace!(
             "Erasing from 0x{:x} to 0x{:x}",
-            FLASH_BASE as u32 + from,
-            FLASH_BASE as u32 + to
+            FLASH_BASE + from,
+            FLASH_BASE + to
         );
 
         let len = to - from;
@@ -166,10 +209,11 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
     /// The offset and buffer must be aligned.
     ///
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// Write operations always use physical flash offsets (not affected by READ_BASE).
     pub fn blocking_write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Error> {
         check_write(self, offset, bytes.len())?;
 
-        trace!("Writing {:?} bytes to 0x{:x}", bytes.len(), FLASH_BASE as u32 + offset);
+        trace!("Writing {:?} bytes to 0x{:x}", bytes.len(), FLASH_BASE + offset);
 
         let end_offset = offset as usize + bytes.len();
 
@@ -248,11 +292,68 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
         };
         Ok(jedec.unwrap())
     }
+
+    /// Explicitly invalidate a flash range in the XIP cache.
+    ///
+    /// Normally you don't need to call this — [`blocking_erase`] and [`blocking_write`]
+    /// automatically invalidate the modified regions. However, this method is useful when:
+    ///
+    /// - External code (e.g., a bootloader) has modified flash without using this driver
+    /// - You need to ensure fresh reads after flash modifications via DMA or other means
+    /// - You're implementing custom flash protocols that bypass the standard write path
+    ///
+    /// This performs targeted invalidation of only the specified range, which is much
+    /// faster than a full cache flush for small regions. Unlike [`flash_flush_cache()`]
+    /// from the bootrom, this does NOT unpin pinned cache lines, making it safe for
+    /// cache-as-SRAM use cases.
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - Start offset from flash base (must be 4-byte aligned on RP2040, 8-byte on RP2350)
+    /// * `to` - End offset from flash base (exclusive, must maintain same alignment as `from`)
+    ///
+    /// [`blocking_erase`]: Self::blocking_erase
+    /// [`blocking_write`]: Self::blocking_write
+    pub fn invalidate_cache_range(&mut self, from: u32, to: u32) {
+        // Safety: Cache invalidation writes are always safe as they only affect
+        // the CPU's view of memory, not the underlying flash content.
+        unsafe { cache::invalidate_range(from, to) }
+    }
 }
 
 impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Blocking, FLASH_SIZE> {
     /// Create a new flash driver in blocking mode.
+    ///
+    /// Uses the default read base address ([`FLASH_BASE`], 0x10000000).
     pub fn new_blocking(_flash: Peri<'d, T>) -> Self {
+        Self {
+            dma: None,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<'d, T: Instance, const FLASH_SIZE: usize, const READ_BASE: u32> Flash<'d, T, Blocking, FLASH_SIZE, READ_BASE> {
+    /// Create a new flash driver in blocking mode with a custom read base address.
+    ///
+    /// Use [`FLASH_BASE_UNTRANSLATED`] to bypass ATRANS on RP2350 and read from
+    /// physical flash addresses directly. This is useful when ATRANS has been
+    /// configured (e.g., by the bootrom) and you need to access flash at known
+    /// physical offsets.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use embassy_rp::flash::{Flash, FLASH_BASE_UNTRANSLATED};
+    ///
+    /// const FLASH_SIZE: usize = 2 * 1024 * 1024; // 2MB, adjust for your flash
+    ///
+    /// // Read from physical flash offset 0x2000 (bypassing ATRANS)
+    /// let mut flash = Flash::<_, _, { FLASH_SIZE }, FLASH_BASE_UNTRANSLATED>::new_blocking_with_base(p.FLASH);
+    /// let mut buf = [0u8; 256];
+    /// flash.blocking_read(0x2000, &mut buf).unwrap();
+    /// ```
+    pub fn new_blocking_with_base(_flash: Peri<'d, T>) -> Self {
         Self {
             dma: None,
             phantom: PhantomData,
@@ -272,12 +373,15 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
             phantom: PhantomData,
         }
     }
+}
 
+impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
     /// Start a background read operation.
     ///
     /// The offset and buffer must be aligned.
     ///
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// The actual address read from is `FLASH_BASE + offset`.
     pub fn background_read<'a>(
         &'a mut self,
         offset: u32,
@@ -285,8 +389,8 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
     ) -> Result<BackgroundRead<'a, 'd, T, FLASH_SIZE>, Error> {
         trace!(
             "Reading in background from 0x{:x} to 0x{:x}",
-            FLASH_BASE as u32 + offset,
-            FLASH_BASE as u32 + offset + (data.len() * 4) as u32
+            FLASH_BASE + offset,
+            FLASH_BASE + offset + (data.len() * 4) as u32
         );
         // Can't use check_read because we need to enforce 4-byte alignment
         let offset = offset as usize;
@@ -304,7 +408,7 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
 
         pac::XIP_CTRL
             .stream_addr()
-            .write_value(pac::xip_ctrl::regs::StreamAddr(FLASH_BASE as u32 + offset as u32));
+            .write_value(pac::xip_ctrl::regs::StreamAddr(FLASH_BASE + offset as u32));
         pac::XIP_CTRL
             .stream_ctr()
             .write_value(pac::xip_ctrl::regs::StreamCtr(data.len() as u32));
@@ -329,11 +433,12 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
         })
     }
 
-    /// Async read.
+    /// Async read using DMA streaming.
     ///
-    /// The offset and buffer must be aligned.
+    /// The offset and buffer must be aligned to 4 bytes.
     ///
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// This method uses XIP streaming which only works with the default FLASH_BASE.
     pub async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Error> {
         use core::mem::MaybeUninit;
 
@@ -375,11 +480,15 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
     }
 }
 
-impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> ErrorType for Flash<'d, T, M, FLASH_SIZE> {
+impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> ErrorType
+    for Flash<'d, T, M, FLASH_SIZE, READ_BASE>
+{
     type Error = Error;
 }
 
-impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> ReadNorFlash for Flash<'d, T, M, FLASH_SIZE> {
+impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> ReadNorFlash
+    for Flash<'d, T, M, FLASH_SIZE, READ_BASE>
+{
     const READ_SIZE: usize = READ_SIZE;
 
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
@@ -391,14 +500,19 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> ReadNorFlash for Flash<'
     }
 }
 
-impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> MultiwriteNorFlash for Flash<'d, T, M, FLASH_SIZE> {}
+impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> MultiwriteNorFlash
+    for Flash<'d, T, M, FLASH_SIZE, READ_BASE>
+{
+}
 
 impl<'d, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash::MultiwriteNorFlash
     for Flash<'d, T, Async, FLASH_SIZE>
 {
 }
 
-impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> NorFlash for Flash<'d, T, M, FLASH_SIZE> {
+impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> NorFlash
+    for Flash<'d, T, M, FLASH_SIZE, READ_BASE>
+{
     const WRITE_SIZE: usize = WRITE_SIZE;
 
     const ERASE_SIZE: usize = ERASE_SIZE;
@@ -418,7 +532,7 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash
     const READ_SIZE: usize = ASYNC_READ_SIZE;
 
     async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
-        self.read(offset, bytes).await
+        Self::read(self, offset, bytes).await
     }
 
     fn capacity(&self) -> usize {
@@ -439,6 +553,255 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash
 
     async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
         self.blocking_write(offset, bytes)
+    }
+}
+
+
+/// XIP cache maintenance operations.
+///
+/// This module provides targeted cache invalidation as an optimization over the bootrom's
+/// `flash_flush_cache()` which flushes the entire 16KB XIP cache. Targeted invalidation
+/// only invalidates the specific address range that was modified, preserving cached code
+/// in other regions and avoiding the performance penalty of cache warm-up.
+///
+/// Reference: pico-sdk `hardware_xip_cache/xip_cache.c`
+mod cache {
+    use core::arch::asm;
+
+    /// Memory barrier to ensure subsequent accesses observe the new cache state.
+    ///
+    /// This uses DSB (Data Synchronization Barrier) followed by ISB (Instruction
+    /// Synchronization Barrier) to ensure:
+    /// 1. All memory accesses before the barrier complete before any after it
+    /// 2. The pipeline is flushed so subsequent instructions see the new cache state
+    #[inline(always)]
+    unsafe fn post_maintenance_barrier() {
+        // DSB SY - full system data synchronization barrier
+        // ISB - instruction synchronization barrier
+        #[cfg(target_arch = "arm")]
+        asm!("dsb sy", "isb", options(nostack, preserves_flags));
+    }
+
+    /// Invalidate cache lines covering the given flash offset range on RP2040.
+    ///
+    /// RP2040 has TWO valid flags per 8-byte cache line (one per 4-byte half),
+    /// so we must write to every 4-byte aligned address to clear both flags.
+    ///
+    /// From RP2040 datasheet Section 2.6.3.2:
+    /// > "A write to the 0x10... mirror will look up the addressed location in
+    /// > the cache, and delete any matching entry found."
+    ///
+    /// # Safety
+    /// - `from` must be 4-byte aligned
+    /// - `to - from` must be a multiple of 4 bytes
+    /// - Should be called after flash operations complete and XIP is re-enabled
+    #[cfg(feature = "rp2040")]
+    #[inline(never)]
+    #[unsafe(link_section = ".data.ram_func")]
+    pub(super) unsafe fn invalidate_range(from: u32, to: u32) {
+        const XIP_BASE: u32 = 0x10000000;
+
+        debug_assert!(from & 0x3 == 0, "from must be 4-byte aligned");
+        debug_assert!((to.wrapping_sub(from)) & 0x3 == 0, "size must be multiple of 4");
+
+        let mut addr = from;
+        while addr < to {
+            // Write to 0x10... alias to invalidate this 4-byte half of the cache line
+            core::ptr::write_volatile((XIP_BASE + addr) as *mut u32, 0);
+            addr += 4;
+        }
+        post_maintenance_barrier();
+    }
+
+    /// Invalidate cache lines covering the given flash offset range on RP2350.
+    ///
+    /// RP2350 uses explicit cache maintenance operations via the 0x18... window.
+    /// Operation code 0x2 = invalidate by address.
+    ///
+    /// From RP2350 datasheet Section 4.4.1.1:
+    /// > "By address: Looks up an address in the cache, then performs the
+    /// > requested maintenance if that line is currently allocated."
+    ///
+    /// # Safety
+    /// - `from` must be 8-byte aligned (cache line boundary)
+    /// - `to - from` must be a multiple of 8 bytes
+    /// - Should be called after flash operations complete and XIP is re-enabled
+    #[cfg(feature = "_rp235x")]
+    #[inline(never)]
+    #[unsafe(link_section = ".data.ram_func")]
+    pub(super) unsafe fn invalidate_range(from: u32, to: u32) {
+        const XIP_MAINTENANCE_BASE: u32 = 0x18000000;
+        const INVALIDATE_BY_ADDR: u32 = 0x2;
+
+        debug_assert!(from & 0x7 == 0, "from must be 8-byte aligned");
+        debug_assert!((to.wrapping_sub(from)) & 0x7 == 0, "size must be multiple of 8");
+
+        let mut addr = from;
+        while addr < to {
+            // Write to maintenance window: base + offset + operation
+            // Using u8 write as pico-sdk does (strb instruction)
+            let maint_addr = (XIP_MAINTENANCE_BASE + addr + INVALIDATE_BY_ADDR) as *mut u8;
+            core::ptr::write_volatile(maint_addr, 0);
+            addr += 8;
+        }
+        post_maintenance_barrier();
+    }
+
+    /// Clear the QSPI_SS IO override that flash_exit_xip() sets on RP2040.
+    ///
+    /// The bootrom's flash_exit_xip() uses IO forcing to drive CS high. This
+    /// must be cleared before returning to XIP mode. Normally flash_flush_cache()
+    /// handles this, but since we're using targeted invalidation instead, we
+    /// need to clear it explicitly.
+    ///
+    /// From pico-sdk flash.c:
+    /// > "Note this is needed to remove CSn IO force as well as cache flushing"
+    ///
+    /// Note: This function is currently unused because the CS clearing is inlined
+    /// in the write_flash_inner asm for efficiency. Kept for documentation and
+    /// potential future use.
+    ///
+    /// # Safety
+    /// Must be called after flash operations but before flash_enter_cmd_xip()
+    #[cfg(feature = "rp2040")]
+    #[inline(never)]
+    #[unsafe(link_section = ".data.ram_func")]
+    #[allow(dead_code)]
+    pub(super) unsafe fn clear_cs_io_force() {
+        // IO_QSPI_GPIO_QSPI_SS_CTRL register address
+        // IO_QSPI_BASE (0x40018000) + GPIO_QSPI_SS_CTRL offset (0x0c)
+        const GPIO_QSPI_SS_CTRL: u32 = 0x4001800c;
+        // OUTOVER field: bits 9:8
+        const OUTOVER_BITS: u32 = 0x00000300;
+
+        let ctrl = GPIO_QSPI_SS_CTRL as *mut u32;
+        let val = core::ptr::read_volatile(ctrl);
+        // Clear OUTOVER bits to return to NORMAL (peripheral controls output)
+        let new_val = val & !OUTOVER_BITS;
+        core::ptr::write_volatile(ctrl, new_val);
+    }
+}
+
+/// Hardware state save/restore for flash operations on RP2350.
+///
+/// This module saves and restores QSPI pad and QMI configuration around flash
+/// operations. This is necessary because:
+///
+/// 1. `flash_exit_xip()` modifies QSPI pad configuration (pull-ups/downs)
+/// 2. The BOOTRAM XIP setup function may not restore the exact QMI configuration
+///    that was set up by the bootloader's boot2
+/// 3. `flash_exit_xip()` modifies QMI CS1 configuration even when CS1 isn't used
+///
+/// Reference: pico-sdk `hardware_flash/flash.c` flash_save_hardware_state()
+#[cfg(feature = "_rp235x")]
+mod hardware_state {
+    use crate::pac;
+
+    /// Saved hardware state for restoration after flash operations.
+    pub(super) struct SavedState {
+        /// QSPI pad configuration (SCLK, SD0-SD3, SS)
+        qspi_pads: [u32; 6],
+        /// QMI M0 (CS0 - main flash) timing register
+        qmi_m0_timing: u32,
+        /// QMI M0 read command register
+        qmi_m0_rcmd: u32,
+        /// QMI M0 read format register
+        qmi_m0_rfmt: u32,
+        /// QMI M1 (CS1 - PSRAM if present) timing register
+        qmi_m1_timing: u32,
+        /// QMI M1 read command register
+        qmi_m1_rcmd: u32,
+        /// QMI M1 read format register
+        qmi_m1_rfmt: u32,
+    }
+
+    impl SavedState {
+        /// Save current QSPI pad and QMI configuration.
+        ///
+        /// Must be called before `connect_internal_flash()` which resets QSPI pads.
+        #[inline(never)]
+        #[unsafe(link_section = ".data.ram_func")]
+        pub(super) fn save() -> Self {
+            let pads_qspi = pac::PADS_QSPI;
+            let qmi = pac::QMI;
+
+            Self {
+                qspi_pads: [
+                    pads_qspi.gpio(0).read().0, // SCLK
+                    pads_qspi.gpio(1).read().0, // SD0
+                    pads_qspi.gpio(2).read().0, // SD1
+                    pads_qspi.gpio(3).read().0, // SD2
+                    pads_qspi.gpio(4).read().0, // SD3
+                    pads_qspi.gpio(5).read().0, // SS
+                ],
+                qmi_m0_timing: qmi.mem(0).timing().read().0,
+                qmi_m0_rcmd: qmi.mem(0).rcmd().read().0,
+                qmi_m0_rfmt: qmi.mem(0).rfmt().read().0,
+                qmi_m1_timing: qmi.mem(1).timing().read().0,
+                qmi_m1_rcmd: qmi.mem(1).rcmd().read().0,
+                qmi_m1_rfmt: qmi.mem(1).rfmt().read().0,
+            }
+        }
+
+        /// Restore QSPI pad and QMI configuration.
+        ///
+        /// Must be called after `flash_enter_cmd_xip()` (boot2) has restored XIP mode.
+        /// Includes a memory barrier to ensure all writes complete before subsequent
+        /// flash accesses.
+        #[inline(never)]
+        #[unsafe(link_section = ".data.ram_func")]
+        pub(super) unsafe fn restore(&self) {
+            let pads_qspi = pac::PADS_QSPI;
+            let qmi = pac::QMI;
+
+            // Restore QSPI pad state (drive strength, slew rate, pulls, etc.)
+            pads_qspi
+                .gpio(0)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[0]));
+            pads_qspi
+                .gpio(1)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[1]));
+            pads_qspi
+                .gpio(2)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[2]));
+            pads_qspi
+                .gpio(3)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[3]));
+            pads_qspi
+                .gpio(4)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[4]));
+            pads_qspi
+                .gpio(5)
+                .write_value(pac::pads::regs::GpioCtrl(self.qspi_pads[5]));
+
+            // Restore QMI M0 (CS0 - main flash) state
+            qmi.mem(0)
+                .timing()
+                .write_value(pac::qmi::regs::Timing(self.qmi_m0_timing));
+            qmi.mem(0)
+                .rcmd()
+                .write_value(pac::qmi::regs::Rcmd(self.qmi_m0_rcmd));
+            qmi.mem(0)
+                .rfmt()
+                .write_value(pac::qmi::regs::Rfmt(self.qmi_m0_rfmt));
+
+            // Restore QMI M1 (CS1 - PSRAM) state
+            qmi.mem(1)
+                .timing()
+                .write_value(pac::qmi::regs::Timing(self.qmi_m1_timing));
+            qmi.mem(1)
+                .rcmd()
+                .write_value(pac::qmi::regs::Rcmd(self.qmi_m1_rcmd));
+            qmi.mem(1)
+                .rfmt()
+                .write_value(pac::qmi::regs::Rfmt(self.qmi_m1_rfmt));
+
+            // Memory barrier to ensure all register writes complete before any
+            // subsequent flash accesses.
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            #[cfg(target_arch = "arm")]
+            core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
+        }
     }
 }
 
@@ -529,7 +892,7 @@ mod ram_helpers {
         let mut boot2 = [0u32; 256 / 4];
         let ptrs = if USE_BOOT2 {
             #[cfg(feature = "rp2040")]
-            rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE, 256);
+            rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE as *const u32, 256);
             #[cfg(feature = "_rp235x")]
             core::ptr::copy_nonoverlapping(BOOTRAM_BASE as *const u8, boot2.as_mut_ptr() as *mut u8, 256);
             flash_function_pointers_with_boot2(true, false, &boot2)
@@ -562,7 +925,7 @@ mod ram_helpers {
         let mut boot2 = [0u32; 256 / 4];
         let ptrs = if USE_BOOT2 {
             #[cfg(feature = "rp2040")]
-            rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE, 256);
+            rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE as *const u32, 256);
             #[cfg(feature = "_rp235x")]
             core::ptr::copy_nonoverlapping(BOOTRAM_BASE as *const u8, (boot2).as_mut_ptr() as *mut u8, 256);
             flash_function_pointers_with_boot2(true, true, &boot2)
@@ -600,7 +963,7 @@ mod ram_helpers {
         let mut boot2 = [0u32; 256 / 4];
         let ptrs = if USE_BOOT2 {
             #[cfg(feature = "rp2040")]
-            rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE, 256);
+            rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE as *const u32, 256);
             #[cfg(feature = "_rp235x")]
             core::ptr::copy_nonoverlapping(BOOTRAM_BASE as *const u8, boot2.as_mut_ptr() as *mut u8, 256);
             flash_function_pointers_with_boot2(false, true, &boot2)
@@ -631,6 +994,9 @@ mod ram_helpers {
     #[unsafe(link_section = ".data.ram_func")]
     #[cfg(feature = "rp2040")]
     unsafe fn write_flash_inner(addr: u32, len: u32, data: Option<&[u8]>, ptrs: *const FlashFunctionPointers) {
+        let out_addr: u32;
+        let out_len: u32;
+
         #[cfg(target_arch = "arm")]
         core::arch::asm!(
             "mov r8, r0",
@@ -662,11 +1028,32 @@ mod ram_helpers {
             "blx r4", // flash_range_program(addr, data, len);
             "2:",
 
-            "ldr r4, [{ptrs}, #16]",
-            "blx r4", // flash_flush_cache();
+            // Clear CS IO force instead of calling flash_flush_cache().
+            // flash_exit_xip() forces CS high via IO override; we must clear
+            // this before returning to XIP mode. Normally flash_flush_cache()
+            // handles this, but we use targeted invalidation instead.
+            //
+            // GPIO_QSPI_SS_CTRL = 0x4001800c, OUTOVER bits = 9:8 (mask 0x300)
+            // Build address 0x4001800c (Cortex-M0+ can only use 8-bit immediates)
+            "movs r0, #0x40",
+            "lsls r0, r0, #24",   // r0 = 0x40000000
+            "movs r1, #0x18",
+            "lsls r1, r1, #12",   // r1 = 0x18000
+            "adds r0, r0, r1",    // r0 = 0x40018000
+            "adds r0, #0xc",      // r0 = 0x4001800c (GPIO_QSPI_SS_CTRL)
+            "ldr r1, [r0]",       // r1 = *GPIO_QSPI_SS_CTRL
+            "movs r2, #0x03",
+            "lsls r2, r2, #8",    // r2 = 0x300 (OUTOVER_BITS)
+            "bics r1, r2",        // r1 &= ~OUTOVER_BITS (clear to NORMAL)
+            "str r1, [r0]",       // *GPIO_QSPI_SS_CTRL = r1
 
             "ldr r4, [{ptrs}, #20]",
             "blx r4", // flash_enter_cmd_xip();
+
+            // Copy saved addr/len from high registers to low registers for output.
+            // High registers (r8+) can only be used as clobbers in Thumb-1 code.
+            "mov r0, r8",   // r0 = addr (for output)
+            "mov r1, r10",  // r1 = len (for output)
             ptrs = in(reg) ptrs,
             // Registers r8-r15 are not allocated automatically,
             // so assign them manually. We need to use them as
@@ -676,11 +1063,18 @@ mod ram_helpers {
             in("r1") len,
             out("r3") _,
             out("r4") _,
+            lateout("r0") out_addr,
+            lateout("r1") out_len,
             lateout("r8") _,
             lateout("r9") _,
             lateout("r10") _,
             clobber_abi("C"),
         );
+
+        // Targeted cache invalidation for the modified flash range.
+        // This runs after XIP is re-enabled, so it can execute from flash.
+        // Much faster than full cache flush for bulk operations.
+        super::cache::invalidate_range(out_addr, out_addr.wrapping_add(out_len));
     }
 
     /// # Safety
@@ -696,6 +1090,9 @@ mod ram_helpers {
     #[unsafe(link_section = ".data.ram_func")]
     #[cfg(feature = "_rp235x")]
     unsafe fn write_flash_inner(addr: u32, len: u32, data: Option<&[u8]>, ptrs: *const FlashFunctionPointers) {
+        // Save hardware state before flash operations modify it.
+        let saved_state = super::hardware_state::SavedState::save();
+
         let data = data.map(|d| d.as_ptr()).unwrap_or(core::ptr::null());
         ((*ptrs).connect_internal_flash)();
         ((*ptrs).flash_exit_xip)();
@@ -705,8 +1102,18 @@ mod ram_helpers {
         if (*ptrs).flash_range_program.is_some() {
             ((*ptrs).flash_range_program.unwrap())(addr, data as *const _, len as usize);
         }
-        ((*ptrs).flash_flush_cache)();
+        // RP2350 does not require CS IO force cleanup (QMI handles this differently).
+        // Skip flash_flush_cache() and use targeted invalidation instead.
         ((*ptrs).flash_enter_cmd_xip)();
+
+        // Restore hardware state (QSPI pads, QMI M0/M1 configuration).
+        // This includes a memory barrier to ensure writes complete.
+        saved_state.restore();
+
+        // Targeted cache invalidation for the modified flash range.
+        // This runs after XIP is re-enabled, so it can execute from flash.
+        // Much faster than full cache flush for bulk operations.
+        super::cache::invalidate_range(addr, addr.wrapping_add(len));
     }
 
     #[repr(C)]
@@ -746,7 +1153,7 @@ mod ram_helpers {
     pub unsafe fn flash_unique_id(out: &mut [u8]) {
         let mut boot2 = [0u32; 256 / 4];
         let ptrs = if USE_BOOT2 {
-            rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE, 256);
+            rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE as *const u32, 256);
             flash_function_pointers_with_boot2(false, false, &boot2)
         } else {
             flash_function_pointers(false, false)
@@ -776,7 +1183,7 @@ mod ram_helpers {
     pub unsafe fn flash_jedec_id() -> u32 {
         let mut boot2 = [0u32; 256 / 4];
         let ptrs = if USE_BOOT2 {
-            rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE, 256);
+            rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE as *const u32, 256);
             flash_function_pointers_with_boot2(false, false, &boot2)
         } else {
             flash_function_pointers(false, false)
