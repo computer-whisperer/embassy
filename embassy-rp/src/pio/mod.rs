@@ -892,7 +892,14 @@ impl<'d, PIO: Instance + 'd, const SM: usize> StateMachine<'d, PIO, SM> {
                     config.pins.out_base + config.pins.out_count - 1,
                 )
             }
-            let shift = if low_ok { 0 } else { 16 };
+            let current_base: u8 = if PIO::PIO.gpiobase().read().gpiobase() { 16 } else { 0 };
+            let shift = if low_ok && high_ok {
+                current_base // both windows work, keep current setting
+            } else if low_ok {
+                0
+            } else {
+                16
+            };
 
             sm.pinctrl().write(|w| {
                 w.set_sideset_count(config.pins.sideset_count);
