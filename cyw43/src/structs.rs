@@ -553,3 +553,57 @@ impl BssInfo {
         ))
     }
 }
+
+/// `wl_pkteng_t` — argument to the `pkteng` IOVAR on the `-mfgtest` WLAN image.
+///
+/// Drives the packet engine for continuous TX (and RX) in RF test mode. Layout
+/// matches WHD's `whd_wlioctl.h`: four LE `u32`s, a sequence-number flag byte,
+/// then destination and source MAC addresses. `repr(C)` lays the four `u32`s at
+/// offsets 0/4/8/12 with no implicit padding; `_pad` then rounds the wire size
+/// up to 32 bytes (the mfgtest handler expects a buffer of at least 32) while
+/// keeping every byte explicitly initialised (so `to_bytes`' transmute never
+/// reads uninitialised padding).
+#[cfg(feature = "rf-test")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct WlPktEng {
+    /// `WL_PKTENG_PER_TX_START` / `_STOP` (and RX variants).
+    pub flags: u32,
+    /// Inter-packet gap, microseconds.
+    pub delay: u32,
+    /// Number of frames; `0` means continuous.
+    pub nframes: u32,
+    /// Per-frame length in bytes.
+    pub length: u32,
+    /// Enable/disable sequence numbering.
+    pub seqno: u8,
+    /// Destination MAC.
+    pub dest: [u8; 6],
+    /// Source MAC.
+    pub src: [u8; 6],
+    _pad: [u8; 3],
+}
+#[cfg(feature = "rf-test")]
+impl_bytes!(WlPktEng);
+
+#[cfg(feature = "rf-test")]
+impl WlPktEng {
+    /// `WL_PKTENG_PER_TX_START` — begin continuous TX.
+    pub const TX_START: u32 = 0x01;
+    /// `WL_PKTENG_PER_TX_STOP` — stop TX.
+    pub const TX_STOP: u32 = 0x02;
+
+    /// Build a `pkteng` argument; `dest`/`src` default to broadcast, `seqno` off.
+    pub fn new(flags: u32, delay: u32, nframes: u32, length: u32) -> Self {
+        Self {
+            flags,
+            delay,
+            nframes,
+            length,
+            seqno: 0,
+            dest: [0xff; 6],
+            src: [0xff; 6],
+            _pad: [0; 3],
+        }
+    }
+}
