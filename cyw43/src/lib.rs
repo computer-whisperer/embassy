@@ -114,20 +114,26 @@ const CHIP: Chip = Chip {
 };
 
 /// Driver state.
-pub struct State {
+///
+/// `N_RX`/`N_TX` size the wifi frame-buffer channels; each slot holds a full
+/// MTU (1514 B) frame. The defaults match upstream. BT-only users that discard
+/// the returned `NetDriver` can instantiate `State<1, 1>` to reclaim ~9 KB of
+/// RAM — the runner still owns the channel endpoints, but no wifi frames flow
+/// when the wifi interface is never brought up.
+pub struct State<const N_RX: usize = 4, const N_TX: usize = 4> {
     ioctl_state: IoctlState,
-    net: NetState,
+    net: NetState<N_RX, N_TX>,
     #[cfg(feature = "bluetooth")]
     bt: bluetooth::BtState,
 }
 
-struct NetState {
-    ch: ch::State<MTU, 4, 4>,
+struct NetState<const N_RX: usize, const N_TX: usize> {
+    ch: ch::State<MTU, N_RX, N_TX>,
     events: Events,
     secure_network: AtomicBool,
 }
 
-impl State {
+impl<const N_RX: usize, const N_TX: usize> State<N_RX, N_TX> {
     /// Create new driver state holder.
     pub const fn new() -> Self {
         Self {
@@ -236,8 +242,8 @@ pub type NetDriver<'a> = ch::Device<'a, MTU>;
 ///
 /// Returns a handle to the network device, control handle and a runner for driving the low level
 /// stack.
-pub async fn new<'a, PWR, SPI>(
-    state: &'a mut State,
+pub async fn new<'a, PWR, SPI, const N_RX: usize, const N_TX: usize>(
+    state: &'a mut State<N_RX, N_TX>,
     pwr: PWR,
     spi: SPI,
     firmware: &mut impl FirmwareReader,
@@ -275,8 +281,8 @@ where
 ///
 /// Returns a handle to the network device, control handle and a runner for driving the low level
 /// stack.
-pub async fn new_sdio<'a, SDIO>(
-    state: &'a mut State,
+pub async fn new_sdio<'a, SDIO, const N_RX: usize, const N_TX: usize>(
+    state: &'a mut State<N_RX, N_TX>,
     sdio: SDIO,
     firmware: &mut impl FirmwareReader,
     nvram: &[u8],
@@ -313,8 +319,8 @@ where
 /// Returns a handle to the network device, control handle and a runner for driving the low level
 /// stack.
 #[cfg(feature = "bluetooth")]
-pub async fn new_with_bluetooth<'a, PWR, SPI>(
-    state: &'a mut State,
+pub async fn new_with_bluetooth<'a, PWR, SPI, const N_RX: usize, const N_TX: usize>(
+    state: &'a mut State<N_RX, N_TX>,
     pwr: PWR,
     spi: SPI,
     wifi_firmware: &mut impl FirmwareReader,
