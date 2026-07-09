@@ -323,6 +323,18 @@ impl<'d, T: Instance> I2c<'d, T, Async> {
     ///
     /// Also handles an abort which arises while processing the tx fifo.
     async fn wait_stop_det(&mut self, had_abort: Result<(), Error>, do_stop: bool) -> Result<(), Error> {
+        // "abort => a hardware-generated STOP follows" does NOT hold for
+        // arbitration loss: a master that loses arbitration surrenders the bus
+        // (stops driving SCL, FSM to IDLE) and never issues a STOP (RP2350
+        // datasheet §12.2.8), so waiting for STOP_DET here blocks until the
+        // caller gives up. Return the error immediately instead; the next
+        // transaction's setup runs bus recovery if a slave is still holding
+        // SDA. (Observed on hardware: a desynced slave ACKing into the
+        // master's R/W bit causes a genuine ARB_LOST even on a single-master
+        // bus.)
+        if let Err(Error::Abort(AbortReason::ArbitrationLoss)) = had_abort {
+            return had_abort;
+        }
         if had_abort.is_err() || do_stop {
             let p = T::regs();
 
