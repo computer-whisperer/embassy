@@ -917,17 +917,25 @@ where
         }
         let mut iterator = operations.iter_mut();
 
+        // Per the embedded-hal `I2c::transaction` contract, "between adjacent
+        // operations of a different type an SR and SAD+R/W is sent". A read
+        // that is not the first operation necessarily follows a write, so
+        // introduce it with an explicit repeated START (matching
+        // `write_read_async`) instead of relying on the controller's
+        // implicit direction-change handling.
+        let mut first = true;
         while let Some(op) = iterator.next() {
             let last = iterator.len() == 0;
 
             match op {
                 Operation::Read(buffer) => {
-                    self.read_async_internal(buffer, false, last).await?;
+                    self.read_async_internal(buffer, !first, last).await?;
                 }
                 Operation::Write(buffer) => {
                     self.write_async_internal(buffer.iter().cloned(), last).await?;
                 }
             }
+            first = false;
         }
         Ok(())
     }
