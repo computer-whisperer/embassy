@@ -548,7 +548,28 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
         }
 
         let p = T::regs();
+
+        // Drain any abort left pending by a previous transaction's
+        // cancel-safety OnDrop, which sets IC_ENABLE.ABORT and returns
+        // without completing the abort procedure. Per RP2350 datasheet
+        // §12.2.10.4.1 the TX_ABRT source must be read and cleared - the
+        // FIFO-flush it triggers holds the buffers cleared until
+        // IC_CLR_TX_ABRT is read, so a transaction started against the
+        // undrained peripheral silently loses its queued commands.
+        if p.ic_tx_abrt_source().read().0 != 0 {
+            p.ic_clr_tx_abrt().read();
+        }
+
         p.ic_enable().write(|w| w.set_enable(false));
+        // Disabling is not instantaneous (datasheet §12.2.10.3.1):
+        // reprogramming IC_TAR or writing IC_DATA_CMD before it completes
+        // loses data. Poll IC_ENABLE_STATUS until the controller reports
+        // disabled, bounded so a wedged peripheral can't hang us here.
+        for _ in 0..10_000 {
+            if !p.ic_enable_status().read().ic_en() {
+                break;
+            }
+        }
 
         if !ignore_lockup {
             if self.is_sda_low() {
@@ -561,6 +582,14 @@ impl<'d, T: Instance + 'd, M: Mode> I2c<'d, T, M> {
 
         p.ic_tar().write(|w| w.set_ic_tar(addr));
         p.ic_enable().write(|w| w.set_enable(true));
+        // Same in the enable direction: wait for the enable to take effect
+        // before the caller writes IC_DATA_CMD.
+        for _ in 0..10_000 {
+            if p.ic_enable_status().read().ic_en() {
+                break;
+            }
+        }
+
         Ok(())
     }
 
