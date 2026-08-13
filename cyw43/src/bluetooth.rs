@@ -345,7 +345,13 @@ impl<'a> BtRunner<'a> {
     }
 
     pub(crate) async fn hci_write(&mut self, bus: &mut impl Bus) {
+        // [bleip-diag] Phase-timing for the #72 TX-cost investigation: point E
+        // measured ~110 ms per hci_write under load. Attribute it: bus wake
+        // (bt_bus_request), ring-space check, or the payload writes.
+        let diag_t0 = embassy_time::Instant::now();
+
         self.bt_bus_request(bus).await;
+        let diag_t_wake = embassy_time::Instant::now();
 
         // NOTE(unwrap): we only call this when we do have a packet in the queue.
         let buf = self.tx_chan.try_receive().unwrap();
@@ -401,6 +407,16 @@ impl<'a> BtRunner<'a> {
         bt_toggle_intr(bus).await;
 
         buf.receive_done();
+
+        let diag_total = diag_t0.elapsed();
+        if diag_total > embassy_time::Duration::from_millis(50) {
+            warn!(
+                "[bleip-diag] hci_write took {} ms (wake {} ms, write {} ms)",
+                diag_total.as_millis(),
+                (diag_t_wake - diag_t0).as_millis(),
+                (embassy_time::Instant::now() - diag_t_wake).as_millis()
+            );
+        }
     }
 
     async fn bt_has_work(&mut self, bus: &mut impl Bus) -> bool {
@@ -463,6 +479,24 @@ impl<'a> BtRunner<'a> {
 
                 buf.len = 1 + len as usize;
                 debug!("HCI rx: {:02x}", crate::fmt::Bytes(&buf.buf[..buf.len]));
+
+                // [bleip-diag] Point C of the #72 stall bisection: gap between
+                // consecutive HCI RX packets handed up from the BTSDIO ring.
+                // With an active LE connection the controller emits steady
+                // traffic (inbound ACL + completion events), so a multi-second
+                // gap here means packets sat in the chip / IRQ never serviced;
+                // point A (trouble ingest) late WITHOUT point C means the
+                // stall is between this hand-up and trouble's dispatch.
+                {
+                    use core::sync::atomic::{AtomicU32, Ordering};
+                    static LAST_HCI_RX_MS: AtomicU32 = AtomicU32::new(0);
+                    let now_ms = embassy_time::Instant::now().as_millis() as u32;
+                    let prev = LAST_HCI_RX_MS.swap(now_ms, Ordering::Relaxed);
+                    let gap = now_ms.wrapping_sub(prev);
+                    if prev != 0 && gap > 500 {
+                        warn!("[bleip-diag] HCI rx gap {} ms (point C)", gap);
+                    }
+                }
 
                 buf.send_done();
 
