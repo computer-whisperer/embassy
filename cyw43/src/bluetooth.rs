@@ -419,7 +419,17 @@ impl<'a> BtRunner<'a> {
         }
     }
 
-    async fn bt_has_work(&mut self, bus: &mut impl Bus) -> bool {
+    /// Acknowledge the BT mailbox doorbell if it is pending.
+    ///
+    /// The doorbell is only a WAKE source, never a data-presence gate: the
+    /// chip raises `I_HMB_FC_CHANGE` and advances `BTSDIO_OFFSET_BT2HOST_IN`
+    /// as two separate operations, so a write-1-clear here can consume the
+    /// doorbell for a packet whose ring-pointer advance is not yet visible.
+    /// Gating the ring read on this bit parked LL-acked inbound ACL in the
+    /// BT2HOST ring for 0.5–1 s beats (#72: point C/E gaps with timely
+    /// host-side Number-of-Completed-Packets) until the next doorbell — the
+    /// drain loop below must therefore always check the ring pointer.
+    async fn bt_ack_doorbell(&mut self, bus: &mut impl Bus) {
         let int_status = bus.bp_read32(CHIP.sdiod_core_base_address + SDIO_INT_STATUS).await;
         if int_status & I_HMB_FC_CHANGE != 0 {
             bus.bp_write32(
@@ -427,81 +437,78 @@ impl<'a> BtRunner<'a> {
                 int_status & I_HMB_FC_CHANGE,
             )
             .await;
-            return true;
         }
-        return false;
     }
 
     pub(crate) async fn handle_irq(&mut self, bus: &mut impl Bus) {
-        if self.bt_has_work(bus).await {
-            loop {
-                // Check if we have data.
-                let write_pointer = bus.bp_read32(self.addr + BTSDIO_OFFSET_BT2HOST_IN).await;
-                let available = write_pointer.wrapping_sub(self.b2h_read_pointer) % BTSDIO_FWBUF_SIZE;
-                if available == 0 {
-                    break;
-                }
-
-                // read header
-                let mut header = [0u8; 4];
-                let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + self.b2h_read_pointer;
-                bus.bp_read(addr, &mut header).await;
-
-                // calc length
-                let len = header[0] as u32 | ((header[1]) as u32) << 8 | ((header[2]) as u32) << 16;
-                let rounded_len = round_up(len, 4);
-                if available < 4 + rounded_len {
-                    warn!("ringbuf data not enough for a full packet?");
-                    break;
-                }
-                self.b2h_read_pointer = (self.b2h_read_pointer + 4) % BTSDIO_FWBUF_SIZE;
-
-                // Obtain a buf from the channel.
-                let mut buf = self.rx_chan.send().await;
-
-                buf.buf[0] = header[3]; // hci packet type
-                let payload = &mut buf.buf[1..][..rounded_len as usize];
-                if self.b2h_read_pointer as usize + payload.len() > BTSDIO_FWBUF_SIZE as usize {
-                    // wraparound
-                    let n = BTSDIO_FWBUF_SIZE - self.b2h_read_pointer;
-                    let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + self.b2h_read_pointer;
-                    bus.bp_read(addr, &mut payload[..n as usize]).await;
-                    let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF;
-                    bus.bp_read(addr, &mut payload[n as usize..]).await;
-                } else {
-                    // no wraparound
-                    let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + self.b2h_read_pointer;
-                    bus.bp_read(addr, payload).await;
-                }
-                self.b2h_read_pointer = (self.b2h_read_pointer + payload.len() as u32) % BTSDIO_FWBUF_SIZE;
-                bus.bp_write32(self.addr + BTSDIO_OFFSET_BT2HOST_OUT, self.b2h_read_pointer)
-                    .await;
-
-                buf.len = 1 + len as usize;
-                debug!("HCI rx: {:02x}", crate::fmt::Bytes(&buf.buf[..buf.len]));
-
-                // [bleip-diag] Point C of the #72 stall bisection: gap between
-                // consecutive HCI RX packets handed up from the BTSDIO ring.
-                // With an active LE connection the controller emits steady
-                // traffic (inbound ACL + completion events), so a multi-second
-                // gap here means packets sat in the chip / IRQ never serviced;
-                // point A (trouble ingest) late WITHOUT point C means the
-                // stall is between this hand-up and trouble's dispatch.
-                {
-                    use core::sync::atomic::{AtomicU32, Ordering};
-                    static LAST_HCI_RX_MS: AtomicU32 = AtomicU32::new(0);
-                    let now_ms = embassy_time::Instant::now().as_millis() as u32;
-                    let prev = LAST_HCI_RX_MS.swap(now_ms, Ordering::Relaxed);
-                    let gap = now_ms.wrapping_sub(prev);
-                    if prev != 0 && gap > 500 {
-                        warn!("[bleip-diag] HCI rx gap {} ms (point C)", gap);
-                    }
-                }
-
-                buf.send_done();
-
-                self.bt_toggle_intr(bus).await;
+        self.bt_ack_doorbell(bus).await;
+        loop {
+            // Check if we have data.
+            let write_pointer = bus.bp_read32(self.addr + BTSDIO_OFFSET_BT2HOST_IN).await;
+            let available = write_pointer.wrapping_sub(self.b2h_read_pointer) % BTSDIO_FWBUF_SIZE;
+            if available == 0 {
+                break;
             }
+
+            // read header
+            let mut header = [0u8; 4];
+            let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + self.b2h_read_pointer;
+            bus.bp_read(addr, &mut header).await;
+
+            // calc length
+            let len = header[0] as u32 | ((header[1]) as u32) << 8 | ((header[2]) as u32) << 16;
+            let rounded_len = round_up(len, 4);
+            if available < 4 + rounded_len {
+                warn!("ringbuf data not enough for a full packet?");
+                break;
+            }
+            self.b2h_read_pointer = (self.b2h_read_pointer + 4) % BTSDIO_FWBUF_SIZE;
+
+            // Obtain a buf from the channel.
+            let mut buf = self.rx_chan.send().await;
+
+            buf.buf[0] = header[3]; // hci packet type
+            let payload = &mut buf.buf[1..][..rounded_len as usize];
+            if self.b2h_read_pointer as usize + payload.len() > BTSDIO_FWBUF_SIZE as usize {
+                // wraparound
+                let n = BTSDIO_FWBUF_SIZE - self.b2h_read_pointer;
+                let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + self.b2h_read_pointer;
+                bus.bp_read(addr, &mut payload[..n as usize]).await;
+                let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF;
+                bus.bp_read(addr, &mut payload[n as usize..]).await;
+            } else {
+                // no wraparound
+                let addr = self.addr + BTSDIO_OFFSET_HOST_READ_BUF + self.b2h_read_pointer;
+                bus.bp_read(addr, payload).await;
+            }
+            self.b2h_read_pointer = (self.b2h_read_pointer + payload.len() as u32) % BTSDIO_FWBUF_SIZE;
+            bus.bp_write32(self.addr + BTSDIO_OFFSET_BT2HOST_OUT, self.b2h_read_pointer)
+                .await;
+
+            buf.len = 1 + len as usize;
+            debug!("HCI rx: {:02x}", crate::fmt::Bytes(&buf.buf[..buf.len]));
+
+            // [bleip-diag] Point C of the #72 stall bisection: gap between
+            // consecutive HCI RX packets handed up from the BTSDIO ring.
+            // With an active LE connection the controller emits steady
+            // traffic (inbound ACL + completion events), so a multi-second
+            // gap here means packets sat in the chip / IRQ never serviced;
+            // point A (trouble ingest) late WITHOUT point C means the
+            // stall is between this hand-up and trouble's dispatch.
+            {
+                use core::sync::atomic::{AtomicU32, Ordering};
+                static LAST_HCI_RX_MS: AtomicU32 = AtomicU32::new(0);
+                let now_ms = embassy_time::Instant::now().as_millis() as u32;
+                let prev = LAST_HCI_RX_MS.swap(now_ms, Ordering::Relaxed);
+                let gap = now_ms.wrapping_sub(prev);
+                if prev != 0 && gap > 500 {
+                    warn!("[bleip-diag] HCI rx gap {} ms (point C)", gap);
+                }
+            }
+
+            buf.send_done();
+
+            self.bt_toggle_intr(bus).await;
         }
     }
 }
