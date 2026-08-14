@@ -77,6 +77,14 @@ impl<'d, PIO: Instance, const SM: usize> PioUartTx<'d, PIO, SM> {
     pub async fn write_u8(&mut self, data: u8) {
         self.sm_tx.tx().wait_push(data as u32).await;
     }
+
+    /// Change the baud rate at runtime by recomputing the clock divider. Any
+    /// byte already in the TX FIFO/shift register keeps the old rate; drain
+    /// before changing if that matters.
+    pub fn set_baud(&mut self, baud: u32) {
+        self.sm_tx.set_clock_divider((clk_sys_freq() / (8 * baud)).to_fixed());
+        self.sm_tx.clkdiv_restart();
+    }
 }
 
 impl<PIO: Instance, const SM: usize> ErrorType for PioUartTx<'_, PIO, SM> {
@@ -171,6 +179,12 @@ impl<'d, PIO: Instance, const SM: usize> PioUartRx<'d, PIO, SM> {
     /// Wait for a single u8
     pub async fn read_u8(&mut self) -> u8 {
         self.sm_rx.rx().wait_pull().await as u8
+    }
+
+    /// Change the baud rate at runtime by recomputing the clock divider.
+    pub fn set_baud(&mut self, baud: u32) {
+        self.sm_rx.set_clock_divider((clk_sys_freq() / (8 * baud)).to_fixed());
+        self.sm_rx.clkdiv_restart();
     }
 }
 

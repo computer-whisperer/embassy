@@ -343,15 +343,24 @@ where
 
             BusType::Spi => {
                 // Set up the interrupt mask and enable interrupts
+                let mut bus_int_enable = IRQ_F2_PACKET_AVAILABLE;
                 if bt_fw.is_some() {
                     debug!("bluetooth setup interrupt mask");
                     self.bus
                         .bp_write32(CHIP.sdiod_core_base_address + SDIO_INT_HOST_MASK, I_HMB_FC_CHANGE)
                         .await;
+                    // The BT mailbox interrupt (I_HMB_FC_CHANGE, unmasked above)
+                    // surfaces at the gSPI level as an F1 interrupt; enabling it
+                    // here makes the IRQ line assert for BT traffic so the run
+                    // loop's event wait is real instead of a busy-poll. Same as
+                    // the vendor driver (cyw43_ll.c enables F1_INTR when built
+                    // with bluetooth). No explicit ack needed: the bit follows
+                    // the backplane source, which bt_has_work clears.
+                    bus_int_enable |= IRQ_F1_INTR;
                 }
 
                 self.bus
-                    .write16(FUNC_BUS, REG_BUS_INTERRUPT_ENABLE, IRQ_F2_PACKET_AVAILABLE)
+                    .write16(FUNC_BUS, REG_BUS_INTERRUPT_ENABLE, bus_int_enable)
                     .await;
 
                 // "Lower F2 Watermark to avoid DMA Hang in F2 when SD Clock is stopped."
@@ -492,6 +501,16 @@ where
     /// Run the CYW43 event handling loop.
     pub async fn run(mut self) -> ! {
         let mut buf = [0; 512];
+        // [bleip-diag] Point E of the #72 stall bisection: BT RX is serviced
+        // only by the busy-poll arm (Fourth), which select4 prefers LAST —
+        // ioctl/WLAN-TX/BT-TX arms all preempt it. Track the time between
+        // RX-service iterations and how many higher-priority arms ran in
+        // between: a large gap with many bt-tx arms = TX-preference
+        // starvation; a large gap with few arms = a single blocking bus op.
+        let mut diag_last_rx_service = embassy_time::Instant::now();
+        let mut diag_n_ioctl: u32 = 0;
+        let mut diag_n_wifi: u32 = 0;
+        let mut diag_n_bttx: u32 = 0;
         loop {
             #[cfg(feature = "firmware-logs")]
             self.log_read().await;
@@ -511,12 +530,10 @@ where
                 #[cfg(not(feature = "bluetooth"))]
                 let bt_tx = core::future::pending::<()>();
 
-                // interrupts aren't working yet for bluetooth. Do busy-polling instead.
-                // Note for this to work `ev` has to go last in the `select()`. It prefers
-                // first futures if they're ready, so other select branches don't get starved.`
-                #[cfg(feature = "bluetooth")]
-                let ev = core::future::ready(());
-                #[cfg(not(feature = "bluetooth"))]
+                // Real interrupt wait for both WLAN and BT: F2_PACKET_AVAILABLE
+                // covers WLAN RX and F1_INTR (enabled at init when BT firmware
+                // is loaded) covers the BT mailbox, so the IRQ line asserts for
+                // everything the Fourth arm services — no busy-polling.
                 let ev = self.bus.wait_for_event();
 
                 match select4(ioctl, wifi_tx, bt_tx, ev).await {
@@ -526,10 +543,12 @@ where
                         cmd,
                         iface,
                     }) => {
+                        diag_n_ioctl += 1;
                         self.send_ioctl(kind, cmd, iface, unsafe { &*iobuf }, &mut buf).await;
                         self.check_status(&mut buf).await;
                     }
                     Either4::Second(packet) => {
+                        diag_n_wifi += 1;
                         trace!("tx pkt {:02x}", Bytes(&packet[..packet.len().min(48)]));
 
                         let buf8 = slice8_mut(&mut buf);
@@ -584,10 +603,43 @@ where
                         self.check_status(&mut buf).await;
                     }
                     Either4::Third(_) => {
+                        diag_n_bttx += 1;
                         #[cfg(feature = "bluetooth")]
-                        self.bt.as_mut().unwrap().hci_write(&mut self.bus).await;
+                        {
+                            self.bt.as_mut().unwrap().hci_write(&mut self.bus).await;
+                            // Service BT RX between TX packets. select4 prefers
+                            // this arm over the RX busy-poll arm, so a sustained
+                            // TX burst (h2 flush, retransmit train) would
+                            // otherwise park inbound ACL (TCP ACKs, PTP) in the
+                            // BT2HOST ring for the whole burst — measured 0.5 to
+                            // 1.2 s of RX starvation (#72 point E). Draining here
+                            // bounds RX latency to one hci_write.
+                            self.bt.as_mut().unwrap().handle_irq(&mut self.bus).await;
+                        }
                     }
                     Either4::Fourth(()) => {
+                        {
+                            let now = embassy_time::Instant::now();
+                            let gap = now - diag_last_rx_service;
+                            // Arms-ran condition: with the interrupt-driven event
+                            // wait, a long gap with zero intervening arms is just
+                            // an idle link; only a gap spanned by other work is
+                            // starvation.
+                            let arms_ran = diag_n_ioctl + diag_n_wifi + diag_n_bttx > 0;
+                            if arms_ran && gap > embassy_time::Duration::from_millis(500) {
+                                warn!(
+                                    "[bleip-diag] cyw43 RX-service gap {} ms (point E; arms since: ioctl={} wifi={} bttx={})",
+                                    gap.as_millis(),
+                                    diag_n_ioctl,
+                                    diag_n_wifi,
+                                    diag_n_bttx
+                                );
+                            }
+                            diag_last_rx_service = now;
+                            diag_n_ioctl = 0;
+                            diag_n_wifi = 0;
+                            diag_n_bttx = 0;
+                        }
                         self.handle_irq(&mut buf).await;
 
                         // If we do busy-polling, make sure to yield.

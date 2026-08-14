@@ -448,7 +448,8 @@ embassy_hal_internal::peripherals! {
     BOOTSEL,
 
     POWMAN,
-    TRNG
+    TRNG,
+    SHA256
 }
 
 #[cfg(all(not(feature = "boot2-none"), feature = "rp2040"))]

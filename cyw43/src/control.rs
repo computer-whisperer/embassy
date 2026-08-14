@@ -762,6 +762,109 @@ impl<'a> Control<'a> {
     }
 }
 
+/// Manufacturing / RF-test surface.
+///
+/// These methods only do something useful when the chip is running the
+/// `-mfgtest` WLAN firmware image (which exposes the `phy_tx_tone*`, `pkteng`,
+/// and `carrier_suppress` IOVARs). On the production blob the IOVARs are absent
+/// and the chip rejects them. They are gated behind the `rf-test` cargo feature
+/// and are intended for the Raven `cyw43_rf_test` example firmware, used for
+/// radiated-emissions certification and RF bench bring-up.
+///
+/// Wire-format provenance: the `compliance-radio-test-mode` investigation
+/// (decoded from the mfgtest `bcm_iovar_t` tables). Open questions remain about
+/// the exact units of the tone-frequency arguments and which channel/band
+/// IOVARs the image expects before a tone starts — see that investigation.
+#[cfg(feature = "rf-test")]
+impl<'a> Control<'a> {
+    /// Minimal bring-up for the `-mfgtest` image: load the CLM blob and bring
+    /// the WiFi interface up.
+    ///
+    /// Deliberately does **not** call [`Control::init`]'s production-only IOVARs
+    /// (`apsta`, `ampdu_*`, `country`, `SetAntdiv`) — the mfgtest image is a
+    /// stripped personality that may not implement them (some are already
+    /// annotated `// this crashes` in `init`). Whether the image needs *any*
+    /// init beyond this is an open question to resolve on hardware.
+    pub async fn rf_test_init(&mut self, clm: &[u8]) {
+        self.load_clm(clm).await;
+        self.up().await;
+    }
+
+    /// Set the operating channel via `WLC_SET_CHANNEL` (2.4 GHz channels 1..=14).
+    pub async fn rf_set_channel(&mut self, channel: u32) {
+        self.ioctl_set_u32(Ioctl::SetChannel, 0, channel).await;
+    }
+
+    /// Start an unmodulated CW carrier, `freq_hz` interpreted by the `phy_tx_tone_hz`
+    /// IOVAR (varid 371). NOTE: the exact units (Hz vs PHY frequency offset) are
+    /// unverified — confirm against a spectrum analyzer / SDR.
+    pub async fn start_tx_tone_hz(&mut self, freq_hz: u32) {
+        self.set_iovar_u32("phy_tx_tone_hz", freq_hz).await;
+    }
+
+    /// Start a CW carrier via `phy_tx_tone` (varid 369), whose `u32` argument is
+    /// a PHY frequency offset rather than Hz.
+    pub async fn start_tx_tone_offset(&mut self, freq_offset: u32) {
+        self.set_iovar_u32("phy_tx_tone", freq_offset).await;
+    }
+
+    /// Stop the CW carrier (`phy_tx_tone_stop`, a `u8` IOVAR).
+    pub async fn stop_tx_tone(&mut self) {
+        self.set_iovar("phy_tx_tone_stop", &[1]).await;
+    }
+
+    /// Gate the carrier on/off (`carrier_suppress`, a `u8` IOVAR). `true`
+    /// suppresses the carrier.
+    pub async fn set_carrier_suppress(&mut self, suppress: bool) {
+        self.set_iovar("carrier_suppress", &[suppress as u8]).await;
+    }
+
+    /// Minimum Power Consumption (`mpc`). When enabled (the default), the
+    /// firmware powers the radio core down whenever the interface is idle —
+    /// which silences a manually-started tone after a sub-second timeout. Set
+    /// `false` before any RF test so the radio stays up.
+    pub async fn set_mpc(&mut self, enable: bool) {
+        self.set_iovar_u32("mpc", enable as u32).await;
+    }
+
+    /// Periodic PHY watchdog (`phy_watchdog`). It re-runs PHY calibration at
+    /// roughly 1 Hz, which resets the DAC sample-playback path that the tone
+    /// rides on (the tone visibly dies ~1 s after it starts). Set `false`
+    /// before starting a tone.
+    pub async fn set_phy_watchdog(&mut self, enable: bool) {
+        self.set_iovar_u32("phy_watchdog", enable as u32).await;
+    }
+
+    /// Set the baseband multiplier (`phy_bbmult`) — coarse TX amplitude.
+    pub async fn set_bb_mult(&mut self, mult: u32) {
+        self.set_iovar_u32("phy_bbmult", mult).await;
+    }
+
+    /// Set the TX power index (`phy_txpwrindex`).
+    pub async fn set_txpwr_index(&mut self, index: u32) {
+        self.set_iovar_u32("phy_txpwrindex", index).await;
+    }
+
+    /// Enable/disable closed-loop TX power control (`phy_txpwrctrl`). Open-loop
+    /// (disabled) is usually what you want so `phy_txpwrindex` takes effect.
+    pub async fn set_txpwr_ctrl(&mut self, enable: bool) {
+        self.set_iovar_u32("phy_txpwrctrl", enable as u32).await;
+    }
+
+    /// Start continuous TX via the packet engine (`pkteng`). `nframes == 0` is
+    /// continuous; `delay_us` is the inter-frame gap.
+    pub async fn pkteng_tx_start(&mut self, delay_us: u32, nframes: u32, length: u32) {
+        let p = WlPktEng::new(WlPktEng::TX_START, delay_us, nframes, length);
+        self.set_iovar("pkteng", &p.to_bytes()).await;
+    }
+
+    /// Stop the packet engine.
+    pub async fn pkteng_stop(&mut self) {
+        let p = WlPktEng::new(WlPktEng::TX_STOP, 0, 0, 0);
+        self.set_iovar("pkteng", &p.to_bytes()).await;
+    }
+}
+
 /// WiFi network scanner.
 pub struct Scanner<'a> {
     subscriber: EventSubscriber<'a>,
