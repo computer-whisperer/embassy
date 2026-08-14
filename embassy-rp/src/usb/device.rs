@@ -248,6 +248,10 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         if ints.bus_reset() {
             regs.inte().write_clear(|w| w.set_bus_reset(true));
             BUS_WAKER.wake();
+            // Wake any control-pipe future so it can abort: the host will
+            // never finish the transfer it was waiting on.
+            EP_IN_WAKERS[0].wake();
+            EP_OUT_WAKERS[0].wake();
         }
         if ints.dev_resume_from_host() {
             regs.inte().write_clear(|w| w.set_dev_resume_from_host(true));
@@ -260,6 +264,9 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         if ints.setup_req() {
             regs.inte().write_clear(|w| w.set_setup_req(true));
             EP_OUT_WAKERS[0].wake();
+            // A new SETUP supersedes whatever control transfer was in
+            // flight; wake a possibly-parked IN-side future so it aborts.
+            EP_IN_WAKERS[0].wake();
         }
 
         if ints.buff_status() {
@@ -611,6 +618,18 @@ pub struct ControlPipe<'d, T: Instance> {
     max_packet_size: u16,
 }
 
+/// True when the in-flight control transfer can never complete: a new SETUP
+/// packet superseded it, or the bus was reset. The data/status-stage futures
+/// below poll host-driven completion bits, so without this check an abandoned
+/// transfer (cancelled URB, reset mid-transfer) parks the control pipe — and
+/// with it the whole device task — forever: the device loop only returns to
+/// `Bus::poll`/`setup` once the current transfer future resolves. Neither
+/// flag is cleared here; `setup()` and `Bus::poll` own them.
+fn control_transfer_aborted<T: Instance>() -> bool {
+    let status = T::regs().sie_status().read();
+    status.setup_rec() || status.bus_reset()
+}
+
 impl<'d, T: Instance> driver::ControlPipe for ControlPipe<'d, T> {
     fn max_packet_size(&self) -> usize {
         64
@@ -667,12 +686,15 @@ impl<'d, T: Instance> driver::ControlPipe for ControlPipe<'d, T> {
             EP_OUT_WAKERS[0].register(cx.waker());
             let val = T::dpram().ep_out_buffer_control(0).read();
             if val.available(0) {
+                if control_transfer_aborted::<T>() {
+                    return Poll::Ready(Err(EndpointError::Disabled));
+                }
                 Poll::Pending
             } else {
-                Poll::Ready(val)
+                Poll::Ready(Ok(val))
             }
         })
-        .await;
+        .await?;
 
         let rx_len = val.length(0) as _;
         trace!("control data_out DONE, rx_len = {}", rx_len);
@@ -712,12 +734,15 @@ impl<'d, T: Instance> driver::ControlPipe for ControlPipe<'d, T> {
             EP_IN_WAKERS[0].register(cx.waker());
             let bufcontrol = T::dpram().ep_in_buffer_control(0);
             if bufcontrol.read().available(0) {
+                if control_transfer_aborted::<T>() {
+                    return Poll::Ready(Err(EndpointError::Disabled));
+                }
                 Poll::Pending
             } else {
-                Poll::Ready(())
+                Poll::Ready(Ok(()))
             }
         })
-        .await;
+        .await?;
         trace!("control: data_in DONE");
 
         if last {
@@ -756,10 +781,15 @@ impl<'d, T: Instance> driver::ControlPipe for ControlPipe<'d, T> {
         });
 
         // wait for completion before returning, needed so
-        // set_address() doesn't happen early.
+        // set_address() doesn't happen early. Bail out if the host abandons
+        // the transfer (new SETUP / bus reset): the status stage will never
+        // be collected, and a reset re-zeroes the address anyway.
         poll_fn(|cx| {
             EP_IN_WAKERS[0].register(cx.waker());
             if bufcontrol.read().available(0) {
+                if control_transfer_aborted::<T>() {
+                    return Poll::Ready(());
+                }
                 Poll::Pending
             } else {
                 Poll::Ready(())
