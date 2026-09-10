@@ -160,6 +160,26 @@ pub struct Trng<'d, T: Instance> {
 const TRNG_BLOCK_SIZE_BITS: usize = 192;
 const TRNG_BLOCK_SIZE_BYTES: usize = TRNG_BLOCK_SIZE_BITS / 8;
 
+/// How many times the blocking API resets and restarts the block after a
+/// health-test failure before giving up. Each attempt is one full generation,
+/// so a persistent failure costs a few hundred microseconds, not a hang.
+const MAX_HEALTH_TEST_RESETS: u32 = 4;
+
+/// Errors from the fallible blocking API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Error {
+    /// The block's built-in health tests (autocorrelation, CRNGT, von Neumann)
+    /// kept failing across [`MAX_HEALTH_TEST_RESETS`] resets.
+    ///
+    /// On some parts and operating points the internal ring oscillator locks
+    /// to a harmonic of the sample clock and the autocorrelation test then
+    /// fails deterministically, so retrying cannot help. Either change
+    /// [`Config::sample_count`] / [`Config::inverter_chain_length`], or bypass
+    /// the tests and condition the raw samples with a hash, as the bootrom does.
+    HealthTestsFailed,
+}
+
 impl<'d, T: Instance> Trng<'d, T> {
     /// Create a new TRNG driver.
     pub fn new(_trng: Peri<'d, T>, _irq: impl Binding<T::Interrupt, InterruptHandler<T>> + 'd, config: Config) -> Self {
@@ -217,28 +237,58 @@ impl<'d, T: Instance> Trng<'d, T> {
         T::Interrupt::disable();
     }
 
-    fn blocking_wait_for_successful_generation(&self) {
-        let regs = T::regs();
+    /// True if any health test has flagged an error in RNG_ISR.
+    fn health_test_failed(&self) -> bool {
+        let isr = T::regs().rng_isr().read();
+        isr.autocorr_err() || isr.crngt_err() || isr.vn_err()
+    }
 
+    /// Software-reset the block and start a fresh generation with the
+    /// configured parameters. This is the only thing that clears AUTOCORR_ERR
+    /// (RNG_ICR cannot, per the datasheet).
+    fn reset_and_restart(&self) {
+        let regs = T::regs();
+        regs.trng_sw_reset().write(|w| w.set_trng_sw_reset(true));
+        // Fixed delay is required after TRNG soft reset. This read is sufficient.
+        regs.trng_sw_reset().read();
+        self.initialize_rng();
+        self.start_rng();
+    }
+
+    /// Wait for one 192-bit generation to complete with valid data.
+    ///
+    /// The busy wait also watches the health-test flags. After a failure
+    /// (AUTOCORR_ERR: "Autocorrelation test failed four times in a row. When
+    /// set, RNG ceases functioning until next reset"; likewise CRNGT_ERR /
+    /// VN_ERR) TRNG_BUSY stays asserted, so a bare `while busy {}` never
+    /// returns and the error can never be seen — observed as a hard hang on
+    /// RP2350 hardware. On a failure the block is reset and restarted, at most
+    /// [`MAX_HEALTH_TEST_RESETS`] times.
+    fn blocking_wait_for_successful_generation(&self) -> Result<(), Error> {
+        let regs = T::regs();
         let trng_busy_register = regs.trng_busy();
         let trng_valid_register = regs.trng_valid();
 
-        let mut success = false;
-        while success.not() {
-            while trng_busy_register.read().trng_busy() {}
-            if trng_valid_register.read().ehr_valid().not() {
-                if regs.rng_isr().read().autocorr_err() {
-                    regs.trng_sw_reset().write(|w| w.set_trng_sw_reset(true));
-                    // Fixed delay is required after TRNG soft reset. This read is sufficient.
-                    regs.trng_sw_reset().read();
-                    self.initialize_rng();
-                    self.start_rng();
-                } else {
-                    panic!("RNG not busy, but ehr is not valid!")
+        let mut resets = 0;
+        loop {
+            let failed = loop {
+                if self.health_test_failed() {
+                    break true;
                 }
-            } else {
-                success = true
+                if trng_busy_register.read().trng_busy().not() {
+                    break false;
+                }
+            };
+            if failed.not() && trng_valid_register.read().ehr_valid() {
+                return Ok(());
             }
+            // A health test failed, or BUSY dropped without valid data (the
+            // block was reset underneath us). Either way, start over.
+            if resets >= MAX_HEALTH_TEST_RESETS {
+                return Err(Error::HealthTestsFailed);
+            }
+            resets += 1;
+            self.reset_and_restart();
         }
     }
 
@@ -256,11 +306,6 @@ impl<'d, T: Instance> Trng<'d, T> {
         for (i, reg) in ehr_data_regs.iter().enumerate() {
             buffer[i * 4..i * 4 + 4].copy_from_slice(&reg.read().to_ne_bytes());
         }
-    }
-
-    fn blocking_read_ehr_registers_into_array(&mut self, buffer: &mut [u8; TRNG_BLOCK_SIZE_BYTES]) {
-        self.blocking_wait_for_successful_generation();
-        self.read_ehr_registers_into_array(buffer);
     }
 
     /// Fill the buffer with random bytes, async version.
@@ -324,28 +369,50 @@ impl<'d, T: Instance> Trng<'d, T> {
         .await
     }
 
-    /// Fill the buffer with random bytes, blocking version.
-    pub fn blocking_fill_bytes(&mut self, destination: &mut [u8]) {
+    /// Fill the buffer with random bytes, blocking, fallible version.
+    ///
+    /// Returns [`Error::HealthTestsFailed`] instead of hanging when the block's
+    /// health tests keep failing; the block is left stopped in that case.
+    pub fn try_blocking_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), Error> {
         if destination.is_empty() {
-            return; // Nothing to fill
+            return Ok(()); // Nothing to fill
         }
         self.start_rng();
 
         let mut buffer = [0u8; TRNG_BLOCK_SIZE_BYTES];
 
         for chunk in destination.chunks_mut(TRNG_BLOCK_SIZE_BYTES) {
-            self.blocking_wait_for_successful_generation();
-            self.blocking_read_ehr_registers_into_array(&mut buffer);
+            if let Err(e) = self.blocking_wait_for_successful_generation() {
+                self.stop_rng();
+                return Err(e);
+            }
+            self.read_ehr_registers_into_array(&mut buffer);
             chunk.copy_from_slice(&buffer[..chunk.len()])
         }
-        self.stop_rng()
+        self.stop_rng();
+        Ok(())
+    }
+
+    /// Fill the buffer with random bytes, blocking version.
+    ///
+    /// Panics if the health tests keep failing (see
+    /// [`Self::try_blocking_fill_bytes`] for the fallible variant). A panic is
+    /// deliberate: the alternative is an unbounded spin.
+    pub fn blocking_fill_bytes(&mut self, destination: &mut [u8]) {
+        self.try_blocking_fill_bytes(destination)
+            .expect("TRNG health tests failed repeatedly; see trng::Error::HealthTestsFailed")
+    }
+
+    fn blocking_wait_or_panic(&self) {
+        self.blocking_wait_for_successful_generation()
+            .expect("TRNG health tests failed repeatedly; see trng::Error::HealthTestsFailed")
     }
 
     /// Return a random u32, blocking.
     pub fn blocking_next_u32(&mut self) -> u32 {
         let regs = T::regs();
         self.start_rng();
-        self.blocking_wait_for_successful_generation();
+        self.blocking_wait_or_panic();
         // 12.12.3 After successful generation, read the last result register, EHR_DATA[5] to
         // clear all of the result registers.
         let result = regs.ehr_data5().read();
@@ -357,7 +424,7 @@ impl<'d, T: Instance> Trng<'d, T> {
     pub fn blocking_next_u64(&mut self) -> u64 {
         let regs = T::regs();
         self.start_rng();
-        self.blocking_wait_for_successful_generation();
+        self.blocking_wait_or_panic();
 
         let low = regs.ehr_data4().read() as u64;
         // 12.12.3 After successful generation, read the last result register, EHR_DATA[5] to
