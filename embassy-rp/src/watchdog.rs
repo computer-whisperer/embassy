@@ -73,9 +73,18 @@ impl Watchdog {
     // (everything except ROSC, XOSC)
     fn configure_wdog_reset_triggers(&self) {
         let psm = pac::PSM;
-        psm.wdsel().write_value(pac::psm::regs::Wdsel(
-            0x0001ffff & !(0x01 << 0usize) & !(0x01 << 1usize),
-        ));
+        // Every PSM stage the chip has: 17 on RP2040, 25 on RP2350.
+        #[cfg(feature = "rp2040")]
+        let mut wdsel = pac::psm::regs::Wdsel(0x0001_ffff);
+        #[cfg(feature = "_rp235x")]
+        let mut wdsel = pac::psm::regs::Wdsel(0x01ff_ffff);
+        // Clear the oscillators by name: the stage order differs between the
+        // chips (RP2350 puts PROC_COLD and OTP ahead of ROSC/XOSC), so the
+        // RP2040 bit positions would skip the OTP reset on RP2350 and leave
+        // OTP soft-locks in place across a watchdog reboot.
+        wdsel.set_rosc(false);
+        wdsel.set_xosc(false);
+        psm.wdsel().write_value(wdsel);
     }
 
     /// Feed the watchdog timer
