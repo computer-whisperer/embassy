@@ -488,24 +488,6 @@ impl<'a> BtRunner<'a> {
             buf.len = 1 + len as usize;
             debug!("HCI rx: {:02x}", crate::fmt::Bytes(&buf.buf[..buf.len]));
 
-            // [bleip-diag] Point C of the #72 stall bisection: gap between
-            // consecutive HCI RX packets handed up from the BTSDIO ring.
-            // With an active LE connection the controller emits steady
-            // traffic (inbound ACL + completion events), so a multi-second
-            // gap here means packets sat in the chip / IRQ never serviced;
-            // point A (trouble ingest) late WITHOUT point C means the
-            // stall is between this hand-up and trouble's dispatch.
-            {
-                use core::sync::atomic::{AtomicU32, Ordering};
-                static LAST_HCI_RX_MS: AtomicU32 = AtomicU32::new(0);
-                let now_ms = embassy_time::Instant::now().as_millis() as u32;
-                let prev = LAST_HCI_RX_MS.swap(now_ms, Ordering::Relaxed);
-                let gap = now_ms.wrapping_sub(prev);
-                if prev != 0 && gap > 500 {
-                    warn!("[bleip-diag] HCI rx gap {} ms (point C)", gap);
-                }
-            }
-
             buf.send_done();
 
             self.bt_toggle_intr(bus).await;
