@@ -1,8 +1,8 @@
+use core::convert::Infallible;
 use core::future::Future;
 use core::mem::MaybeUninit;
 
-use bt_hci::transport::WithIndicator;
-use bt_hci::{ControllerToHostPacket, FromHciBytes, FromHciBytesError, HostToControllerPacket, PacketKind, WriteHci};
+use bt_hci_transport::{PacketToController, ReadHciError};
 use embassy_futures::yield_now;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -521,15 +521,6 @@ pub enum Error {
     Io(ErrorKind),
 }
 
-impl From<FromHciBytesError> for Error {
-    fn from(e: FromHciBytesError) -> Self {
-        match e {
-            FromHciBytesError::InvalidSize => Error::Io(ErrorKind::InvalidInput),
-            FromHciBytesError::InvalidValue => Error::Io(ErrorKind::InvalidData),
-        }
-    }
-}
-
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         core::fmt::Debug::fmt(self, f)
@@ -550,30 +541,45 @@ impl embedded_io_async::Error for Error {
     }
 }
 
-impl<'d> bt_hci::transport::Transport for BtDriver<'d> {
-    fn read<'a>(&self, rx: &'a mut [u8]) -> impl Future<Output = Result<ControllerToHostPacket<'a>, Self::Error>> {
+impl From<ReadHciError<Infallible>> for Error {
+    fn from(e: ReadHciError<Infallible>) -> Self {
+        match e {
+            ReadHciError::InvalidValue => Error::Io(ErrorKind::InvalidData),
+            ReadHciError::BufferTooSmall => Error::Io(ErrorKind::InvalidInput),
+            ReadHciError::Read(e) => match e {
+                embedded_io_async::ReadExactError::UnexpectedEof => Error::Io(ErrorKind::BrokenPipe),
+                embedded_io_async::ReadExactError::Other(_) => unreachable!(),
+            },
+        }
+    }
+}
+
+impl<'d> bt_hci_transport::Transport for BtDriver<'d> {
+    fn read<'a, P: bt_hci_transport::PacketToHost<'a>>(
+        &self,
+        rx: &'a mut [u8],
+    ) -> impl Future<Output = Result<P, Self::Error>> {
         async {
             let mut ch = self.rx.lock().await;
             let buf = ch.receive().await;
-            let n = buf.len;
-            assert!(n < rx.len());
-            rx[..n].copy_from_slice(&buf.buf[..n]);
-            buf.receive_done();
+            assert!(buf.len < rx.len());
 
-            let kind = PacketKind::from_hci_bytes_complete(&rx[..1])?;
-            let (pkt, _) = ControllerToHostPacket::from_hci_bytes_with_kind(kind, &rx[1..n])?;
-            Ok(pkt)
+            let mut reader = &buf.buf[..buf.len];
+            let result =
+                bt_hci_transport::PacketKind::read(&mut reader).and_then(|kind| P::read_hci(kind, &mut reader, rx));
+            buf.receive_done();
+            result.map_err(Error::from)
         }
     }
 
     /// Write a complete HCI packet from the tx buffer
-    fn write<T: HostToControllerPacket>(&self, val: &T) -> impl Future<Output = Result<(), Self::Error>> {
+    fn write<P: PacketToController>(&self, tx: &P) -> impl Future<Output = Result<(), Self::Error>> {
         async {
             let mut ch = self.tx.lock().await;
             let mut buf = ch.send().await;
             let buf_len = buf.buf.len();
             let mut slice = &mut buf.buf[..];
-            WithIndicator::new(val)
+            bt_hci_transport::WithIndicator::new(tx)
                 .write_hci(&mut slice)
                 .map_err(|_| Error::Io(ErrorKind::Other))?;
             buf.len = buf_len - slice.len();
