@@ -10,7 +10,7 @@
 
 #![cfg(feature = "_rp235x")]
 
-use critical_section::{CriticalSection, RestoreState, acquire, release};
+use critical_section::{acquire, release, CriticalSection, RestoreState};
 
 use crate::pac;
 use crate::qmi_cs1::QmiCs1;
@@ -24,8 +24,17 @@ pub enum Error {
     DeviceNotFound,
     /// Invalid configuration
     InvalidConfig,
-    /// Detected PSRAM size does not match the expected size
-    SizeMismatch,
+    /// Detected PSRAM size does not match the expected size. Carries the raw
+    /// KGD/EID bytes read from the device and the size decoded from them (0
+    /// when the KGD did not match) so a board bring-up log identifies the part.
+    SizeMismatch {
+        /// Known-good-die byte (0x5D for APS6404L).
+        kgd: u8,
+        /// Electronic ID byte (density in bits 7:5).
+        eid: u8,
+        /// Size decoded from KGD/EID, in bytes.
+        detected: u32,
+    },
 }
 
 /// PSRAM device verification type.
@@ -295,7 +304,11 @@ impl<'d> Psram<'d> {
 
             // Verify the detected size matches the expected size
             if detected_size as usize != expected_size {
-                return Err(Error::SizeMismatch);
+                return Err(Error::SizeMismatch {
+                    kgd: kgd as u8,
+                    eid: eid as u8,
+                    detected: detected_size,
+                });
             }
 
             Ok(())
