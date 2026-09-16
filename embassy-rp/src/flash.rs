@@ -125,20 +125,70 @@ impl<'a, 'd, T: Instance, const FLASH_SIZE: usize> Future for BackgroundRead<'a,
 
 impl<'a, 'd, T: Instance, const FLASH_SIZE: usize> Drop for BackgroundRead<'a, 'd, T, FLASH_SIZE> {
     fn drop(&mut self) {
-        if pac::XIP_CTRL.stream_ctr().read().0 == 0 {
-            return;
+        if pac::XIP_CTRL.stream_ctr().read().0 != 0 {
+            pac::XIP_CTRL
+                .stream_ctr()
+                .write_value(pac::xip_ctrl::regs::StreamCtr(0));
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            // Errata RP2040-E8: Perform an uncached read to make sure there's not a transfer in
+            // flight that might effect an address written to start a new transfer.  This stalls
+            // until after any transfer is complete, so the address will not change anymore.
+            unsafe {
+                core::ptr::read_volatile(FLASH_BASE_UNCACHED as *const u32);
+            }
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
-        pac::XIP_CTRL
-            .stream_ctr()
-            .write_value(pac::xip_ctrl::regs::StreamCtr(0));
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        // Errata RP2040-E8: Perform an uncached read to make sure there's not a transfer in
-        // flight that might effect an address written to start a new transfer.  This stalls
-        // until after any transfer is complete, so the address will not change anymore.
-        unsafe {
-            core::ptr::read_volatile(FLASH_BASE_UNCACHED as *const u32);
-        }
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // Hand the streamer back to the application (see `XipStreamHooks`).
+        xip_stream_release();
+    }
+}
+
+/// Cooperative arbitration of the XIP streaming engine and flash-op windows.
+///
+/// The XIP streamer (`STREAM_ADDR`/`STREAM_CTR`/`STREAM_FIFO`) is a single
+/// shared resource: this driver uses it for async [`Flash::read`], and an
+/// application may use it for something else entirely (e.g. streaming a
+/// framebuffer out of QSPI PSRAM). Flash erase/program additionally take the
+/// QMI out of XIP mode, during which *no* XIP traffic may be in flight.
+///
+/// An application that owns the streamer between flash operations registers a
+/// pair of hooks with [`set_xip_stream_hooks`]. `acquire` is called before this
+/// driver touches the streamer or disables XIP, and must return only once the
+/// application has stopped its stream (`STREAM_CTR` = 0, FIFO drained) and will
+/// not restart it; `release` is called once the driver is done. The hooks run
+/// synchronously on the calling core (core 0) and must not block for long —
+/// the driver's async read is the hot path.
+pub struct XipStreamHooks {
+    /// Stop the application's use of the streamer (blocking until stopped).
+    pub acquire: fn(),
+    /// The streamer is free again.
+    pub release: fn(),
+}
+
+static XIP_STREAM_HOOKS: core::sync::atomic::AtomicPtr<XipStreamHooks> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Register the application's XIP-streamer hooks (see [`XipStreamHooks`]).
+/// Call once, before any concurrent streamer use; a later call replaces them.
+pub fn set_xip_stream_hooks(hooks: &'static XipStreamHooks) {
+    XIP_STREAM_HOOKS.store(
+        hooks as *const XipStreamHooks as *mut XipStreamHooks,
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+fn xip_stream_acquire() {
+    let p = XIP_STREAM_HOOKS.load(core::sync::atomic::Ordering::Acquire);
+    if !p.is_null() {
+        // Safety: registered from a `&'static`, never freed.
+        (unsafe { &*p }.acquire)();
+    }
+}
+
+fn xip_stream_release() {
+    let p = XIP_STREAM_HOOKS.load(core::sync::atomic::Ordering::Acquire);
+    if !p.is_null() {
+        (unsafe { &*p }.release)();
     }
 }
 
@@ -401,6 +451,10 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
         if offset % 4 != 0 {
             return Err(Error::Unaligned);
         }
+
+        // Take the streamer from the application first (see `XipStreamHooks`);
+        // the matching release is in `BackgroundRead::drop`.
+        xip_stream_acquire();
 
         while !pac::XIP_CTRL.stat().read().fifo_empty() {
             pac::XIP_CTRL.stream_fifo().read();
@@ -1349,6 +1403,12 @@ pub(crate) unsafe fn in_ram(operation: impl FnOnce()) -> Result<(), Error> {
         return Err(Error::InvalidCore);
     }
 
+    // Stop any application use of the XIP streamer BEFORE pausing core 1: a
+    // stream whose consumer is paused never drains, and the `stream_ctr > 0`
+    // wait below would spin forever. Also guarantees no XIP traffic is in flight
+    // while the QMI is out of XIP mode (see `XipStreamHooks`).
+    xip_stream_acquire();
+
     // Make sure CORE1 is paused during the entire duration of the RAM function
     crate::multicore::pause_core1();
 
@@ -1368,6 +1428,7 @@ pub(crate) unsafe fn in_ram(operation: impl FnOnce()) -> Result<(), Error> {
 
     // Resume CORE1 execution
     crate::multicore::resume_core1();
+    xip_stream_release();
     Ok(())
 }
 
