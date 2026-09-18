@@ -168,6 +168,27 @@ pub struct XipStreamHooks {
 static XIP_STREAM_HOOKS: core::sync::atomic::AtomicPtr<XipStreamHooks> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
+/// Set when the application guarantees that core 1 never touches flash while
+/// it runs: no code, constants, vector fetches or DMA reads from the XIP
+/// window. Flash operations then leave core 1 running instead of pausing it
+/// over the inter-core FIFO for the duration of every program/erase (about a
+/// millisecond each; hundreds during an OTA) — what a real-time consumer such
+/// as a display pump needs.
+static CORE1_FLASH_INDEPENDENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Declare that core 1 is (or is no longer) independent of flash, so flash
+/// operations need not pause it. See [`CORE1_FLASH_INDEPENDENT`].
+///
+/// # Safety
+///
+/// With `true`, the caller guarantees that nothing core 1 executes, reads or
+/// drives (code, data, vector table, DMA) lies in the XIP window for as long
+/// as the flag is set. A flash operation with XIP disabled makes any such
+/// access stall or fault.
+pub unsafe fn set_core1_flash_independent(independent: bool) {
+    CORE1_FLASH_INDEPENDENT.store(independent, core::sync::atomic::Ordering::Release);
+}
+
 /// Register the application's XIP-streamer hooks (see [`XipStreamHooks`]).
 /// Call once, before any concurrent streamer use; a later call replaces them.
 pub fn set_xip_stream_hooks(hooks: &'static XipStreamHooks) {
@@ -1410,7 +1431,11 @@ pub(crate) unsafe fn in_ram(operation: impl FnOnce()) -> Result<(), Error> {
     xip_stream_acquire();
 
     // Make sure CORE1 is paused during the entire duration of the RAM function
-    crate::multicore::pause_core1();
+    // — unless the application has declared it independent of flash.
+    let pause_core1 = !CORE1_FLASH_INDEPENDENT.load(core::sync::atomic::Ordering::Acquire);
+    if pause_core1 {
+        crate::multicore::pause_core1();
+    }
 
     critical_section::with(|_| {
         // Wait for all DMA channels in flash to finish before ram operation
@@ -1427,7 +1452,9 @@ pub(crate) unsafe fn in_ram(operation: impl FnOnce()) -> Result<(), Error> {
     });
 
     // Resume CORE1 execution
-    crate::multicore::resume_core1();
+    if pause_core1 {
+        crate::multicore::resume_core1();
+    }
     xip_stream_release();
     Ok(())
 }
