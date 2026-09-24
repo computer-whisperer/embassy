@@ -55,12 +55,21 @@ unsafe impl Linked<Links<TaskHeader>> for TaskHeader {
 /// by waking its own waker) can't prevent other tasks from running.
 pub(crate) struct RunQueue {
     stack: TransferStack<TaskHeader>,
+    /// Set (plain store) after every push, cleared (plain store) before a
+    /// `take_all`. Lets an empty poll skip the stack's atomic `swap`: on
+    /// RP2350 an exclusive store by one core raises the WFE event on the
+    /// other core, so an unconditional per-idle-round STREX made the two
+    /// idle executors wake each other ~1M times/s (Raven, 2026-09-24).
+    #[cfg(target_has_atomic = "ptr")]
+    pending: core::sync::atomic::AtomicBool,
 }
 
 impl RunQueue {
     pub const fn new() -> Self {
         Self {
             stack: TransferStack::new(),
+            #[cfg(target_has_atomic = "ptr")]
+            pending: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -71,11 +80,15 @@ impl RunQueue {
     /// `item` must NOT be already enqueued in any queue.
     #[inline(always)]
     pub(crate) unsafe fn enqueue(&self, task: TaskRef, _tok: super::state::Token) -> bool {
-        self.stack.push_was_empty(
+        let was_empty = self.stack.push_was_empty(
             task,
             #[cfg(not(target_has_atomic = "ptr"))]
             _tok,
-        )
+        );
+        #[cfg(target_has_atomic = "ptr")]
+        self.pending
+            .store(true, core::sync::atomic::Ordering::Release);
+        was_empty
     }
 
     /// # Standard atomic runqueue
@@ -85,6 +98,17 @@ impl RunQueue {
     /// and will be processed by the *next* call to `dequeue_all`, *not* the current one.
     #[cfg(not(any(feature = "scheduler-priority", feature = "scheduler-deadline")))]
     pub(crate) fn dequeue_all(&self, on_task: impl Fn(TaskRef)) {
+        #[cfg(target_has_atomic = "ptr")]
+        {
+            // Empty poll: no exclusive access at all. A push that lands after
+            // this load sets `pending` again and is taken next round (its
+            // pender wake-up guarantees there is one).
+            if !self.pending.load(core::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            self.pending
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+        }
         let taken = self.stack.take_all();
         for taskref in taken {
             run_dequeue(&taskref);
