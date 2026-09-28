@@ -12,21 +12,27 @@ use core::task::{Context, Poll};
 
 pub use embassy_net_driver as driver;
 use embassy_net_driver::{Capabilities, LinkState};
+use embassy_sync::blocking_mutex::raw::{NoopRawMutex, RawMutex};
 use embassy_sync::blocking_mutex::Mutex;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::waitqueue::WakerRegistration;
 use embassy_sync::zerocopy_channel;
 
 /// Channel state.
 ///
 /// Holds a buffer of packets with size MTU, for both TX and RX.
-pub struct State<const MTU: usize, const N_RX: usize, const N_TX: usize> {
+///
+/// `M` guards the queues and the shared link state. The default
+/// `NoopRawMutex` is right when the [`Runner`] and the [`Device`] are polled
+/// from the same executor; pick `CriticalSectionRawMutex` when the driver
+/// runner lives on a higher-priority (interrupt) executor than the network
+/// stack, so the two ends may interleave.
+pub struct State<const MTU: usize, const N_RX: usize, const N_TX: usize, M: RawMutex = NoopRawMutex> {
     rx: [PacketBuf<MTU>; N_RX],
     tx: [PacketBuf<MTU>; N_TX],
-    inner: MaybeUninit<StateInner<'static, MTU>>,
+    inner: MaybeUninit<StateInner<'static, MTU, M>>,
 }
 
-impl<const MTU: usize, const N_RX: usize, const N_TX: usize> State<MTU, N_RX, N_TX> {
+impl<const MTU: usize, const N_RX: usize, const N_TX: usize, M: RawMutex> State<MTU, N_RX, N_TX, M> {
     /// Create a new channel state.
     pub const fn new() -> Self {
         Self {
@@ -37,10 +43,10 @@ impl<const MTU: usize, const N_RX: usize, const N_TX: usize> State<MTU, N_RX, N_
     }
 }
 
-struct StateInner<'d, const MTU: usize> {
-    rx: zerocopy_channel::Channel<'d, NoopRawMutex, PacketBuf<MTU>>,
-    tx: zerocopy_channel::Channel<'d, NoopRawMutex, PacketBuf<MTU>>,
-    shared: Mutex<NoopRawMutex, RefCell<Shared>>,
+struct StateInner<'d, const MTU: usize, M: RawMutex> {
+    rx: zerocopy_channel::Channel<'d, M, PacketBuf<MTU>>,
+    tx: zerocopy_channel::Channel<'d, M, PacketBuf<MTU>>,
+    shared: Mutex<M, RefCell<Shared>>,
 }
 
 struct Shared {
@@ -52,44 +58,44 @@ struct Shared {
 /// Channel runner.
 ///
 /// Holds the shared state and the lower end of channels for inbound and outbound packets.
-pub struct Runner<'d, const MTU: usize> {
-    tx_chan: zerocopy_channel::Receiver<'d, NoopRawMutex, PacketBuf<MTU>>,
-    rx_chan: zerocopy_channel::Sender<'d, NoopRawMutex, PacketBuf<MTU>>,
-    shared: &'d Mutex<NoopRawMutex, RefCell<Shared>>,
+pub struct Runner<'d, const MTU: usize, M: RawMutex = NoopRawMutex> {
+    tx_chan: zerocopy_channel::Receiver<'d, M, PacketBuf<MTU>>,
+    rx_chan: zerocopy_channel::Sender<'d, M, PacketBuf<MTU>>,
+    shared: &'d Mutex<M, RefCell<Shared>>,
 }
 
 /// State runner.
 ///
 /// Holds the shared state of the channel such as link state.
 #[derive(Clone, Copy)]
-pub struct StateRunner<'d> {
-    shared: &'d Mutex<NoopRawMutex, RefCell<Shared>>,
+pub struct StateRunner<'d, M: RawMutex = NoopRawMutex> {
+    shared: &'d Mutex<M, RefCell<Shared>>,
 }
 
 /// RX runner.
 ///
 /// Holds the lower end of the channel for passing inbound packets up the stack.
-pub struct RxRunner<'d, const MTU: usize> {
-    rx_chan: zerocopy_channel::Sender<'d, NoopRawMutex, PacketBuf<MTU>>,
+pub struct RxRunner<'d, const MTU: usize, M: RawMutex = NoopRawMutex> {
+    rx_chan: zerocopy_channel::Sender<'d, M, PacketBuf<MTU>>,
 }
 
 /// TX runner.
 ///
 /// Holds the lower end of the channel for passing outbound packets down the stack.
-pub struct TxRunner<'d, const MTU: usize> {
-    tx_chan: zerocopy_channel::Receiver<'d, NoopRawMutex, PacketBuf<MTU>>,
+pub struct TxRunner<'d, const MTU: usize, M: RawMutex = NoopRawMutex> {
+    tx_chan: zerocopy_channel::Receiver<'d, M, PacketBuf<MTU>>,
 }
 
 /// A slot for an inbound packet.
-pub struct RxSlot<'a, const MTU: usize>(zerocopy_channel::SendSlot<'a, NoopRawMutex, PacketBuf<MTU>>);
+pub struct RxSlot<'a, const MTU: usize, M: RawMutex = NoopRawMutex>(zerocopy_channel::SendSlot<'a, M, PacketBuf<MTU>>);
 
-impl<'a, const MTU: usize> From<zerocopy_channel::SendSlot<'a, NoopRawMutex, PacketBuf<MTU>>> for RxSlot<'a, MTU> {
-    fn from(value: zerocopy_channel::SendSlot<'a, NoopRawMutex, PacketBuf<MTU>>) -> Self {
+impl<'a, const MTU: usize, M: RawMutex> From<zerocopy_channel::SendSlot<'a, M, PacketBuf<MTU>>> for RxSlot<'a, MTU, M> {
+    fn from(value: zerocopy_channel::SendSlot<'a, M, PacketBuf<MTU>>) -> Self {
         Self(value)
     }
 }
 
-impl<const MTU: usize> Deref for RxSlot<'_, MTU> {
+impl<const MTU: usize, M: RawMutex> Deref for RxSlot<'_, MTU, M> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -97,13 +103,13 @@ impl<const MTU: usize> Deref for RxSlot<'_, MTU> {
     }
 }
 
-impl<const MTU: usize> DerefMut for RxSlot<'_, MTU> {
+impl<const MTU: usize, M: RawMutex> DerefMut for RxSlot<'_, MTU, M> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0.buf
     }
 }
 
-impl<const MTU: usize> RxSlot<'_, MTU> {
+impl<const MTU: usize, M: RawMutex> RxSlot<'_, MTU, M> {
     /// Mark packet of `len` bytes as pushed to the inbound channel.
     pub fn rx_done(mut self, len: usize) {
         self.0.len = len;
@@ -112,9 +118,11 @@ impl<const MTU: usize> RxSlot<'_, MTU> {
 }
 
 /// A slot for an outbound packet.
-pub struct TxSlot<'a, const MTU: usize>(zerocopy_channel::ReceiveSlot<'a, NoopRawMutex, PacketBuf<MTU>>);
+pub struct TxSlot<'a, const MTU: usize, M: RawMutex = NoopRawMutex>(
+    zerocopy_channel::ReceiveSlot<'a, M, PacketBuf<MTU>>,
+);
 
-impl<const MTU: usize> Deref for TxSlot<'_, MTU> {
+impl<const MTU: usize, M: RawMutex> Deref for TxSlot<'_, MTU, M> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -123,29 +131,31 @@ impl<const MTU: usize> Deref for TxSlot<'_, MTU> {
     }
 }
 
-impl<const MTU: usize> DerefMut for TxSlot<'_, MTU> {
+impl<const MTU: usize, M: RawMutex> DerefMut for TxSlot<'_, MTU, M> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         let len = self.0.len;
         &mut self.0.buf[..len]
     }
 }
 
-impl<const MTU: usize> TxSlot<'_, MTU> {
+impl<const MTU: usize, M: RawMutex> TxSlot<'_, MTU, M> {
     /// Mark outbound packet as processed.
     pub fn tx_done(self) {
         self.0.receive_done();
     }
 }
 
-impl<'a, const MTU: usize> From<zerocopy_channel::ReceiveSlot<'a, NoopRawMutex, PacketBuf<MTU>>> for TxSlot<'a, MTU> {
-    fn from(value: zerocopy_channel::ReceiveSlot<'a, NoopRawMutex, PacketBuf<MTU>>) -> Self {
+impl<'a, const MTU: usize, M: RawMutex> From<zerocopy_channel::ReceiveSlot<'a, M, PacketBuf<MTU>>>
+    for TxSlot<'a, MTU, M>
+{
+    fn from(value: zerocopy_channel::ReceiveSlot<'a, M, PacketBuf<MTU>>) -> Self {
         Self(value)
     }
 }
 
-impl<'d, const MTU: usize> Runner<'d, MTU> {
+impl<'d, const MTU: usize, M: RawMutex> Runner<'d, MTU, M> {
     /// Split the runner into separate runners for controlling state, rx and tx.
-    pub fn split(self) -> (StateRunner<'d>, RxRunner<'d, MTU>, TxRunner<'d, MTU>) {
+    pub fn split(self) -> (StateRunner<'d, M>, RxRunner<'d, MTU, M>, TxRunner<'d, MTU, M>) {
         (
             StateRunner { shared: self.shared },
             RxRunner { rx_chan: self.rx_chan },
@@ -154,7 +164,7 @@ impl<'d, const MTU: usize> Runner<'d, MTU> {
     }
 
     /// Split the runner into separate runners for controlling state, rx and tx borrowing the underlying state.
-    pub fn borrow_split(&mut self) -> (StateRunner<'_>, RxRunner<'_, MTU>, TxRunner<'_, MTU>) {
+    pub fn borrow_split(&mut self) -> (StateRunner<'_, M>, RxRunner<'_, MTU, M>, TxRunner<'_, MTU, M>) {
         (
             StateRunner { shared: self.shared },
             RxRunner {
@@ -167,7 +177,7 @@ impl<'d, const MTU: usize> Runner<'d, MTU> {
     }
 
     /// Create a state runner sharing the state channel.
-    pub fn state_runner(&self) -> StateRunner<'d> {
+    pub fn state_runner(&self) -> StateRunner<'d, M> {
         StateRunner { shared: self.shared }
     }
 
@@ -190,17 +200,17 @@ impl<'d, const MTU: usize> Runner<'d, MTU> {
     }
 
     /// Wait until there is space for more inbound packets and return a slot.
-    pub async fn rx_buf(&mut self) -> RxSlot<'_, MTU> {
+    pub async fn rx_buf(&mut self) -> RxSlot<'_, MTU, M> {
         self.rx_chan.send().await.into()
     }
 
     /// Check if there is space for more inbound packets right now.
-    pub fn try_rx_buf(&mut self) -> Option<RxSlot<'_, MTU>> {
+    pub fn try_rx_buf(&mut self) -> Option<RxSlot<'_, MTU, M>> {
         self.rx_chan.try_send().map(Into::into)
     }
 
     /// Polling the inbound channel if there is space for packets.
-    pub fn poll_rx_buf(&'_ mut self, cx: &mut Context) -> Poll<RxSlot<'_, MTU>> {
+    pub fn poll_rx_buf(&'_ mut self, cx: &mut Context) -> Poll<RxSlot<'_, MTU, M>> {
         match self.rx_chan.poll_send(cx) {
             Poll::Ready(slot) => Poll::Ready(slot.into()),
             Poll::Pending => Poll::Pending,
@@ -208,17 +218,17 @@ impl<'d, const MTU: usize> Runner<'d, MTU> {
     }
 
     /// Wait until there is space for more outbound packets and return a slot.
-    pub async fn tx_buf(&mut self) -> TxSlot<'_, MTU> {
+    pub async fn tx_buf(&mut self) -> TxSlot<'_, MTU, M> {
         self.tx_chan.receive().await.into()
     }
 
     /// Check if there is space for more outbound packets right now.
-    pub fn try_tx_buf(&mut self) -> Option<TxSlot<'_, MTU>> {
+    pub fn try_tx_buf(&mut self) -> Option<TxSlot<'_, MTU, M>> {
         self.tx_chan.try_receive().map(Into::into)
     }
 
     /// Polling the outbound channel if there is space for packets.
-    pub fn poll_tx_buf(&mut self, cx: &mut Context) -> Poll<TxSlot<'_, MTU>> {
+    pub fn poll_tx_buf(&mut self, cx: &mut Context) -> Poll<TxSlot<'_, MTU, M>> {
         match self.tx_chan.poll_receive(cx) {
             Poll::Ready(slot) => Poll::Ready(slot.into()),
             Poll::Pending => Poll::Pending,
@@ -226,7 +236,7 @@ impl<'d, const MTU: usize> Runner<'d, MTU> {
     }
 }
 
-impl<'d> StateRunner<'d> {
+impl<'d, M: RawMutex> StateRunner<'d, M> {
     /// Set link state.
     pub fn set_link_state(&self, state: LinkState) {
         self.shared.lock(|s| {
@@ -246,19 +256,19 @@ impl<'d> StateRunner<'d> {
     }
 }
 
-impl<'d, const MTU: usize> RxRunner<'d, MTU> {
+impl<'d, const MTU: usize, M: RawMutex> RxRunner<'d, MTU, M> {
     /// Wait until there is space for more inbound packets and return a slot.
-    pub async fn rx_buf(&mut self) -> RxSlot<'_, MTU> {
+    pub async fn rx_buf(&mut self) -> RxSlot<'_, MTU, M> {
         self.rx_chan.send().await.into()
     }
 
     /// Check if there is space for more inbound packets right now.
-    pub fn try_rx_buf(&mut self) -> Option<RxSlot<'_, MTU>> {
+    pub fn try_rx_buf(&mut self) -> Option<RxSlot<'_, MTU, M>> {
         self.rx_chan.try_send().map(Into::into)
     }
 
     /// Polling the inbound channel if there is space for packets.
-    pub fn poll_rx_buf(&mut self, cx: &mut Context) -> Poll<RxSlot<'_, MTU>> {
+    pub fn poll_rx_buf(&mut self, cx: &mut Context) -> Poll<RxSlot<'_, MTU, M>> {
         match self.rx_chan.poll_send(cx) {
             Poll::Ready(slot) => Poll::Ready(slot.into()),
             Poll::Pending => Poll::Pending,
@@ -266,19 +276,19 @@ impl<'d, const MTU: usize> RxRunner<'d, MTU> {
     }
 }
 
-impl<'d, const MTU: usize> TxRunner<'d, MTU> {
+impl<'d, const MTU: usize, M: RawMutex> TxRunner<'d, MTU, M> {
     /// Wait until there is space for more outbound packets and return a slot.
-    pub async fn tx_buf(&mut self) -> TxSlot<'_, MTU> {
+    pub async fn tx_buf(&mut self) -> TxSlot<'_, MTU, M> {
         self.tx_chan.receive().await.into()
     }
 
     /// Check if there is space for more outbound packets right now.
-    pub fn try_tx_buf(&mut self) -> Option<TxSlot<'_, MTU>> {
+    pub fn try_tx_buf(&mut self) -> Option<TxSlot<'_, MTU, M>> {
         self.tx_chan.try_receive().map(Into::into)
     }
 
     /// Polling the outbound channel if there is space for packets.
-    pub fn poll_tx_buf(&mut self, cx: &mut Context) -> Poll<TxSlot<'_, MTU>> {
+    pub fn poll_tx_buf(&mut self, cx: &mut Context) -> Poll<TxSlot<'_, MTU, M>> {
         match self.tx_chan.poll_receive(cx) {
             Poll::Ready(slot) => Poll::Ready(slot.into()),
             Poll::Pending => Poll::Pending,
@@ -292,18 +302,18 @@ impl<'d, const MTU: usize> TxRunner<'d, MTU> {
 ///
 /// The runner is interfacing with the peripheral at the lower part of the stack.
 /// The device is interfacing with the networking stack on the layer above.
-pub fn new<'d, const MTU: usize, const N_RX: usize, const N_TX: usize>(
-    state: &'d mut State<MTU, N_RX, N_TX>,
+pub fn new<'d, const MTU: usize, const N_RX: usize, const N_TX: usize, M: RawMutex>(
+    state: &'d mut State<MTU, N_RX, N_TX, M>,
     hardware_address: driver::HardwareAddress,
-) -> (Runner<'d, MTU>, Device<'d, MTU>) {
+) -> (Runner<'d, MTU, M>, Device<'d, MTU, M>) {
     let mut caps = Capabilities::default();
     caps.max_transmission_unit = MTU;
 
     // safety: this is a self-referential struct, however:
     // - it can't move while the `'d` borrow is active.
     // - when the borrow ends, the dangling references inside the MaybeUninit will never be used again.
-    let state_uninit: *mut MaybeUninit<StateInner<'d, MTU>> =
-        (&mut state.inner as *mut MaybeUninit<StateInner<'static, MTU>>).cast();
+    let state_uninit: *mut MaybeUninit<StateInner<'d, MTU, M>> =
+        (&mut state.inner as *mut MaybeUninit<StateInner<'static, MTU, M>>).cast();
     let state = unsafe { &mut *state_uninit }.write(StateInner {
         rx: zerocopy_channel::Channel::new(&mut state.rx[..]),
         tx: zerocopy_channel::Channel::new(&mut state.tx[..]),
@@ -348,20 +358,20 @@ impl<const MTU: usize> PacketBuf<MTU> {
 /// Channel device.
 ///
 /// Holds the shared state and upper end of channels for inbound and outbound packets.
-pub struct Device<'d, const MTU: usize> {
-    rx: zerocopy_channel::Receiver<'d, NoopRawMutex, PacketBuf<MTU>>,
-    tx: zerocopy_channel::Sender<'d, NoopRawMutex, PacketBuf<MTU>>,
-    shared: &'d Mutex<NoopRawMutex, RefCell<Shared>>,
+pub struct Device<'d, const MTU: usize, M: RawMutex = NoopRawMutex> {
+    rx: zerocopy_channel::Receiver<'d, M, PacketBuf<MTU>>,
+    tx: zerocopy_channel::Sender<'d, M, PacketBuf<MTU>>,
+    shared: &'d Mutex<M, RefCell<Shared>>,
     caps: Capabilities,
 }
 
-impl<'d, const MTU: usize> embassy_net_driver::Driver for Device<'d, MTU> {
+impl<'d, const MTU: usize, M: RawMutex> embassy_net_driver::Driver for Device<'d, MTU, M> {
     type RxToken<'a>
-        = RxToken<'a, MTU>
+        = RxToken<'a, MTU, M>
     where
         Self: 'a;
     type TxToken<'a>
-        = TxToken<'a, MTU>
+        = TxToken<'a, MTU, M>
     where
         Self: 'a;
 
@@ -403,11 +413,11 @@ impl<'d, const MTU: usize> embassy_net_driver::Driver for Device<'d, MTU> {
 /// A rx token.
 ///
 /// Holds inbound receive channel and interfaces with embassy-net-driver.
-pub struct RxToken<'a, const MTU: usize> {
-    rx: zerocopy_channel::Receiver<'a, NoopRawMutex, PacketBuf<MTU>>,
+pub struct RxToken<'a, const MTU: usize, M: RawMutex = NoopRawMutex> {
+    rx: zerocopy_channel::Receiver<'a, M, PacketBuf<MTU>>,
 }
 
-impl<'a, const MTU: usize> embassy_net_driver::RxToken for RxToken<'a, MTU> {
+impl<'a, const MTU: usize, M: RawMutex> embassy_net_driver::RxToken for RxToken<'a, MTU, M> {
     fn consume<R, F>(mut self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -424,11 +434,11 @@ impl<'a, const MTU: usize> embassy_net_driver::RxToken for RxToken<'a, MTU> {
 /// A tx token.
 ///
 /// Holds outbound transmit channel and interfaces with embassy-net-driver.
-pub struct TxToken<'a, const MTU: usize> {
-    tx: zerocopy_channel::Sender<'a, NoopRawMutex, PacketBuf<MTU>>,
+pub struct TxToken<'a, const MTU: usize, M: RawMutex = NoopRawMutex> {
+    tx: zerocopy_channel::Sender<'a, M, PacketBuf<MTU>>,
 }
 
-impl<'a, const MTU: usize> embassy_net_driver::TxToken for TxToken<'a, MTU> {
+impl<'a, const MTU: usize, M: RawMutex> embassy_net_driver::TxToken for TxToken<'a, MTU, M> {
     fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
