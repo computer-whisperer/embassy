@@ -1043,13 +1043,27 @@ pub(crate) unsafe fn init(config: ClockConfig) {
             #[cfg(feature = "rp2040")]
             vreg.vreg().modify(|w| w.set_vsel(target_vsel));
             #[cfg(feature = "_rp235x")]
-            // For rp235x changes to the voltage regulator are protected by a password, see datasheet section 6.4 Power Management (POWMAN) Registers
-            // The password is "5AFE" (0x5AFE), it must be set in the top 16 bits of the register
-            vreg.vreg().modify(|w| {
-                w.0 = (w.0 & 0x0000FFFF) | (0x5AFE << 16); // Set the password
-                w.set_vsel(target_vsel);
-                *w
-            });
+            {
+                // For rp235x changes to the voltage regulator are protected by a password, see datasheet section 6.4 Power Management (POWMAN) Registers
+                // The password is "5AFE" (0x5AFE), it must be set in the top 16 bits of the register.
+                //
+                // The VREG control interface is also *locked* after power-up (VREG_CTRL.UNLOCK): a VSEL
+                // write while locked reads back as written but the regulator ignores it (measured
+                // 2026-10-06 on an RP2350B: DVDD stayed at 1.06 V for VSEL 1.15 V until the interface
+                // was unlocked; 1.11 V after). This is what pico-sdk's vreg_set_voltage does: unlock,
+                // wait for any update in progress, write, wait again.
+                vreg.vreg_ctrl().modify(|w| {
+                    w.0 = (w.0 & 0x0000FFFF) | (0x5AFE << 16);
+                    w.set_unlock(true);
+                });
+                while vreg.vreg().read().update_in_progress() {}
+                vreg.vreg().modify(|w| {
+                    w.0 = (w.0 & 0x0000FFFF) | (0x5AFE << 16); // Set the password
+                    w.set_vsel(target_vsel);
+                    *w
+                });
+                while vreg.vreg().read().update_in_progress() {}
+            }
 
             // Wait for the voltage to stabilize. Use the provided delay or default based on voltage
             let settling_time_us = config.voltage_stabilization_delay_us.unwrap_or_else(|| {
