@@ -7,7 +7,7 @@ use embassy_usb_driver::{Direction as UsbDirection, EndpointAddress, EndpointInf
 
 pub use super::hid_report::{ReportDescriptor, ReportField};
 use crate::bytes_to_setup;
-use crate::descriptor::ConfigurationDescriptor;
+use crate::descriptor::{ConfigurationDescriptor, InterfaceDescriptor};
 
 /// HID class code.
 const USB_CLASS_HID: u8 = 0x03;
@@ -25,6 +25,26 @@ const SET_PROTOCOL: u8 = 0x0B;
 pub const PROTOCOL_BOOT: u8 = 0;
 /// Report protocol.
 pub const PROTOCOL_REPORT: u8 = 1;
+
+/// Interface subclass: the interface supports the boot protocol.
+pub const SUBCLASS_BOOT: u8 = 1;
+/// Interface protocol (boot subclass): keyboard.
+pub const INTERFACE_PROTOCOL_KEYBOARD: u8 = 1;
+/// Interface protocol (boot subclass): mouse.
+pub const INTERFACE_PROTOCOL_MOUSE: u8 = 2;
+
+/// Interface filter for [`find_hid_where`]: a boot-protocol mouse interface.
+///
+/// Composite devices (e.g. a Logitech Unifying receiver) expose several HID
+/// interfaces; the first one is usually the keyboard.
+pub fn is_boot_mouse(iface: &InterfaceDescriptor<'_>) -> bool {
+    iface.interface_subclass == SUBCLASS_BOOT && iface.interface_protocol == INTERFACE_PROTOCOL_MOUSE
+}
+
+/// Interface filter for [`find_hid_where`]: a boot-protocol keyboard interface.
+pub fn is_boot_keyboard(iface: &InterfaceDescriptor<'_>) -> bool {
+    iface.interface_subclass == SUBCLASS_BOOT && iface.interface_protocol == INTERFACE_PROTOCOL_KEYBOARD
+}
 
 // ── Boot-protocol report structs ─────────────────────────────────────────────
 
@@ -159,10 +179,16 @@ pub struct HidInfo {
 
 /// Find the first HID interface in a configuration descriptor.
 pub fn find_hid(config_desc: &[u8]) -> Option<HidInfo> {
+    find_hid_where(config_desc, |_| true)
+}
+
+/// Find the first HID interface in a configuration descriptor that `accept`
+/// approves of (see [`is_boot_mouse`], [`is_boot_keyboard`]).
+pub fn find_hid_where(config_desc: &[u8], accept: impl Fn(&InterfaceDescriptor<'_>) -> bool) -> Option<HidInfo> {
     let cfg = ConfigurationDescriptor::try_from_slice(config_desc).ok()?;
 
     for iface in cfg.iter_interface() {
-        if iface.interface_class != USB_CLASS_HID {
+        if iface.interface_class != USB_CLASS_HID || !accept(&iface) {
             continue;
         }
 
@@ -180,9 +206,12 @@ pub fn find_hid(config_desc: &[u8]) -> Option<HidInfo> {
             })
             .unwrap_or(0);
 
-        let ep = iface
+        let Some(ep) = iface
             .iter_endpoints()
-            .find(|ep| ep.transfer_type() == TRANSFER_INTERRUPT && ep.is_in())?;
+            .find(|ep| ep.transfer_type() == TRANSFER_INTERRUPT && ep.is_in())
+        else {
+            continue;
+        };
 
         return Some(HidInfo {
             interface_number: iface.interface_number,
@@ -242,6 +271,24 @@ impl<D: UsbHostDriver> HidHost<D> {
     /// then allocates the necessary channels.
     pub fn new(driver: &D, config_desc: &[u8], device_address: u8, max_packet_size_0: u16) -> Result<Self, HidError> {
         let info = find_hid(config_desc).ok_or(HidError::NoInterface)?;
+        Self::from_info(driver, info, device_address, max_packet_size_0)
+    }
+
+    /// Like [`HidHost::new`], but uses the first HID interface that `accept`
+    /// approves of (see [`find_hid_where`]).
+    pub fn new_where(
+        driver: &D,
+        config_desc: &[u8],
+        device_address: u8,
+        max_packet_size_0: u16,
+        accept: impl Fn(&InterfaceDescriptor<'_>) -> bool,
+    ) -> Result<Self, HidError> {
+        let info = find_hid_where(config_desc, accept).ok_or(HidError::NoInterface)?;
+        Self::from_info(driver, info, device_address, max_packet_size_0)
+    }
+
+    /// Drive the HID interface described by `info` (from [`find_hid_where`]).
+    pub fn from_info(driver: &D, info: HidInfo, device_address: u8, max_packet_size_0: u16) -> Result<Self, HidError> {
 
         let ctrl_ep_info = EndpointInfo {
             addr: EndpointAddress::from_parts(0, UsbDirection::In),
