@@ -317,9 +317,11 @@ impl<'d, T: Instance, E: channel::Type, D: channel::Direction> Channel<'d, T, E,
                 w.set_endpoint_type(EpControlEndpointType::INTERRUPT);
                 w.set_interrupt_per_buff(true);
 
-                // FIXME: host_poll_interval (bits 16:25)
-                let interval = self.interval as u32 - 1;
-                w.0 |= interval << 16;
+                // host_poll_interval (bits 16:25), in frames minus one. An
+                // interval of 0 (class drivers that never looked at
+                // bInterval) must not wrap to 1023 ms: poll every frame.
+                let interval = u32::from(self.interval.max(1)) - 1;
+                w.0 |= (interval & 0x3FF) << 16;
 
                 w.set_buffer_address(self.buf.addr);
                 w.set_enable(true);

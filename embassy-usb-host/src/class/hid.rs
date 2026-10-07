@@ -172,6 +172,8 @@ pub struct HidInfo {
     pub interrupt_in_ep: u8,
     /// Interrupt IN max packet size.
     pub interrupt_in_mps: u16,
+    /// Interrupt IN polling interval (bInterval, ms at low/full speed).
+    pub interrupt_in_interval: u8,
     /// Length of the HID Report Descriptor in bytes (from the HID class descriptor).
     /// Pass this to [`HidHost::fetch_report_descriptor`] as the buffer size.
     pub report_descriptor_len: u16,
@@ -217,6 +219,7 @@ pub fn find_hid_where(config_desc: &[u8], accept: impl Fn(&InterfaceDescriptor<'
             interface_number: iface.interface_number,
             interrupt_in_ep: ep.endpoint_address,
             interrupt_in_mps: ep.max_packet_size,
+            interrupt_in_interval: ep.interval,
             report_descriptor_len: report_desc_len,
         });
     }
@@ -301,7 +304,7 @@ impl<D: UsbHostDriver> HidHost<D> {
             addr: EndpointAddress::from_parts((info.interrupt_in_ep & 0x0F) as usize, UsbDirection::In),
             ep_type: EndpointType::Interrupt,
             max_packet_size: info.interrupt_in_mps,
-            interval_ms: 0,
+            interval_ms: info.interrupt_in_interval.max(1),
         };
 
         let ctrl_ch = driver
