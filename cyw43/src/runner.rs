@@ -151,7 +151,7 @@ where
         wifi_fw: &mut impl FirmwareReader,
         nvram: &[u8],
         bt_fw: Option<&[u8]>,
-    ) -> Result<(), ()> {
+    ) -> Result<Option<crate::BtInitTiming>, crate::InitError> {
         self.bus.init(bt_fw.is_some()).await;
 
         // Init ALP (Active Low Power) clock
@@ -190,7 +190,7 @@ where
         .await
         {
             debug!("timeout while waiting for alp clock!");
-            return Err(());
+            return Err(crate::InitError::AlpClock);
         }
         debug!("clock ok");
 
@@ -383,7 +383,7 @@ where
         .await
         {
             debug!("timeout while waiting for function 2 to be ready");
-            return Err(());
+            return Err(crate::InitError::Function2NotReady);
         }
 
         match BUS::TYPE {
@@ -435,13 +435,23 @@ where
         self.log_init().await;
 
         #[cfg(feature = "bluetooth")]
-        if let Some(bt_fw) = bt_fw {
-            self.bt.as_mut().unwrap().init_bluetooth(&mut self.bus, bt_fw).await;
-        }
+        let bt_timing = match bt_fw {
+            Some(bt_fw) => Some(
+                self.bt
+                    .as_mut()
+                    .unwrap()
+                    .init_bluetooth(&mut self.bus, bt_fw)
+                    .await
+                    .map_err(crate::InitError::Bluetooth)?,
+            ),
+            None => None,
+        };
+        #[cfg(not(feature = "bluetooth"))]
+        let bt_timing = None;
 
         debug!("cyw43 runner init done");
 
-        Ok(())
+        Ok(bt_timing)
     }
 
     #[cfg(feature = "firmware-logs")]

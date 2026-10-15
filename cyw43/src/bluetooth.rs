@@ -14,7 +14,14 @@ use crate::consts::*;
 use crate::runner::Bus;
 pub use crate::spi::SpiBusCyw43;
 use crate::util::round_up;
-use crate::{CHIP, util};
+use crate::{BtInitError, BtInitTiming, CHIP, util};
+
+/// How long to wait for the BT core's `FW_RDY` / `BT_AWAKE` flags. The
+/// upstream driver asserted after 300 ms; on the CYW43439 a warm-restarted
+/// BT core sometimes never raises `FW_RDY` at all (Raven GH #87), so the
+/// budget is generous enough to tell "slow" from "hung" and the outcome is
+/// reported to the host instead of asserted.
+pub const BT_READY_TIMEOUT_MS: u32 = 2000;
 
 pub(crate) struct BtState {
     rx: [BtPacketBuf; 4],
@@ -173,17 +180,28 @@ async fn bt_toggle_intr(bus: &mut impl Bus) {
 }
 
 impl<'a> BtRunner<'a> {
-    pub(crate) async fn init_bluetooth(&mut self, bus: &mut impl Bus, firmware: &[u8]) {
+    pub(crate) async fn init_bluetooth(
+        &mut self,
+        bus: &mut impl Bus,
+        firmware: &[u8],
+    ) -> Result<BtInitTiming, BtInitError> {
         trace!("init_bluetooth");
         bus.bp_write32(CHIP.bluetooth_base_address + BT2WLAN_PWRUP_ADDR, BT2WLAN_PWRUP_WAKE)
             .await;
         Timer::after(Duration::from_millis(2)).await;
         self.upload_bluetooth_firmware(bus, firmware).await;
-        self.wait_bt_ready(bus).await;
+        let ready_ms = self
+            .wait_bt_flag(bus, BTSDIO_REG_FW_RDY_BITMASK)
+            .await
+            .map_err(|waited_ms| BtInitError::FirmwareNotReady { waited_ms })?;
         self.init_bt_buffers(bus).await;
-        self.wait_bt_awake(bus).await;
+        let awake_ms = self
+            .wait_bt_flag(bus, BTSDIO_REG_BT_AWAKE_BITMASK)
+            .await
+            .map_err(|waited_ms| BtInitError::NotAwake { waited_ms })?;
         self.bt_set_host_ready(bus).await;
         self.bt_toggle_intr(bus).await;
+        Ok(BtInitTiming { ready_ms, awake_ms })
     }
 
     pub(crate) async fn upload_bluetooth_firmware(&mut self, bus: &mut impl Bus, firmware: &[u8]) {
@@ -262,34 +280,20 @@ impl<'a> BtRunner<'a> {
         }
     }
 
-    pub(crate) async fn wait_bt_ready(&mut self, bus: &mut impl Bus) {
-        trace!("wait_bt_ready");
-        let mut success = false;
-        for _ in 0..300 {
+    /// Poll `BT_CTRL_REG_ADDR` for `mask` at 1 ms, up to
+    /// [`BT_READY_TIMEOUT_MS`]. `Ok(ms)` = how long it took; `Err(ms)` = how
+    /// long the host waited in vain.
+    async fn wait_bt_flag(&mut self, bus: &mut impl Bus, mask: u32) -> Result<u32, u32> {
+        trace!("wait_bt_flag {:08x}", mask);
+        for ms in 0..BT_READY_TIMEOUT_MS {
             let val = bus.bp_read32(BT_CTRL_REG_ADDR).await;
             trace!("BT_CTRL_REG_ADDR = {:08x}", val);
-            if val & BTSDIO_REG_FW_RDY_BITMASK != 0 {
-                success = true;
-                break;
+            if val & mask != 0 {
+                return Ok(ms);
             }
             Timer::after(Duration::from_millis(1)).await;
         }
-        assert!(success == true);
-    }
-
-    pub(crate) async fn wait_bt_awake(&mut self, bus: &mut impl Bus) {
-        trace!("wait_bt_awake");
-        let mut success = false;
-        for _ in 0..300 {
-            let val = bus.bp_read32(BT_CTRL_REG_ADDR).await;
-            trace!("BT_CTRL_REG_ADDR = {:08x}", val);
-            if val & BTSDIO_REG_BT_AWAKE_BITMASK != 0 {
-                success = true;
-                break;
-            }
-            Timer::after(Duration::from_millis(1)).await;
-        }
-        assert!(success == true);
+        Err(BT_READY_TIMEOUT_MS)
     }
 
     pub(crate) async fn bt_set_host_ready(&mut self, bus: &mut impl Bus) {
@@ -341,7 +345,12 @@ impl<'a> BtRunner<'a> {
     async fn bt_bus_request(&mut self, bus: &mut impl Bus) {
         // TODO: CYW43_THREAD_ENTER mutex?
         self.bt_set_awake(bus, true).await;
-        self.wait_bt_awake(bus).await;
+        // Mid-session the core not waking is a dead radio, not a boot
+        // hiccup: log it and let the write proceed (the host notices the
+        // link dying) rather than assert and take the whole unit down.
+        if let Err(waited_ms) = self.wait_bt_flag(bus, BTSDIO_REG_BT_AWAKE_BITMASK).await {
+            warn!("BT core did not wake within {} ms", waited_ms);
+        }
     }
 
     pub(crate) async fn hci_write(&mut self, bus: &mut impl Bus) {

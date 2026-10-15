@@ -12,6 +12,48 @@ pub(crate) mod fmt;
 #[cfg(feature = "bluetooth")]
 /// Bluetooth module.
 pub mod bluetooth;
+
+/// Why driver initialisation failed. `new`/`new_with_bluetooth` used to
+/// `unwrap` these away inside the driver; a host that owns the module's
+/// power can do better (power-cycle and retry, or run without the radio).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum InitError {
+    /// The backplane's ALP clock never came up.
+    AlpClock,
+    /// SDIO/gSPI function 2 never reported ready.
+    Function2NotReady,
+    /// The Bluetooth firmware did not come up (see [`BtInitError`]).
+    Bluetooth(BtInitError),
+}
+
+/// Bluetooth bring-up failure: which handshake flag the BT core never set,
+/// and how long the host waited for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum BtInitError {
+    /// `FW_RDY` never set after the firmware upload.
+    FirmwareNotReady {
+        /// How long the host polled for it.
+        waited_ms: u32,
+    },
+    /// `BT_AWAKE` never set after the buffers were configured.
+    NotAwake {
+        /// How long the host polled for it.
+        waited_ms: u32,
+    },
+}
+
+/// How long the BT core took to raise its bring-up flags — the host's
+/// evidence for whether a slow boot was marginal timing or a hung core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BtInitTiming {
+    /// Milliseconds from the end of the firmware upload to `FW_RDY`.
+    pub ready_ms: u32,
+    /// Milliseconds from buffer setup to `BT_AWAKE`.
+    pub awake_ms: u32,
+}
 mod consts;
 mod control;
 mod countries;
@@ -326,12 +368,16 @@ pub async fn new_with_bluetooth<'a, PWR, SPI, const N_RX: usize, const N_TX: usi
     wifi_firmware: &mut impl FirmwareReader,
     bluetooth_firmware: &[u8],
     nvram: &[u8],
-) -> (
-    NetDriver<'a>,
-    bluetooth::BtDriver<'a>,
-    Control<'a>,
-    Runner<'a, SpiBus<PWR, SPI>>,
-)
+) -> Result<
+    (
+        NetDriver<'a>,
+        bluetooth::BtDriver<'a>,
+        Control<'a>,
+        Runner<'a, SpiBus<PWR, SPI>>,
+        BtInitTiming,
+    ),
+    InitError,
+>
 where
     PWR: OutputPin,
     SPI: SpiBusCyw43,
@@ -350,10 +396,10 @@ where
         Some(bt_runner),
     );
 
-    runner
+    let timing = runner
         .init(wifi_firmware, nvram, Some(bluetooth_firmware))
-        .await
-        .unwrap();
+        .await?
+        .unwrap_or_default();
     let control = Control::new(
         state_ch,
         &state.net.events,
@@ -361,7 +407,7 @@ where
         &state.net.secure_network,
     );
 
-    (device, bt_driver, control, runner)
+    Ok((device, bt_driver, control, runner, timing))
 }
 
 /// Include bytes aligned to A4 in the binary
