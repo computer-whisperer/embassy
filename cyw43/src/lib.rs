@@ -83,6 +83,16 @@ pub use crate::structs::BssInfo;
 
 const MTU: usize = 1514;
 
+/// Words in the runner's F2 (ioctl / event / wifi data) transfer buffer; also
+/// the largest single bus transaction the SPI/SDIO transport must stage. See
+/// the `full-f2` feature.
+pub const F2_BUF_WORDS: usize = if cfg!(feature = "full-f2") { 512 } else { 128 };
+
+/// Frame slot size of the net-driver channel (`State::net.ch`). MTU-sized
+/// with `full-f2`; a stub otherwise (the `NetDriver` is then only a type
+/// witness — wifi data frames are dropped in `Runner::rx`).
+const CH_MTU: usize = if cfg!(feature = "full-f2") { MTU } else { 64 };
+
 #[allow(unused)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Core {
@@ -170,7 +180,7 @@ pub struct State<const N_RX: usize = 4, const N_TX: usize = 4> {
 }
 
 struct NetState<const N_RX: usize, const N_TX: usize> {
-    ch: ch::State<MTU, N_RX, N_TX>,
+    ch: ch::State<CH_MTU, N_RX, N_TX>,
     events: Events,
     secure_network: AtomicBool,
 }
@@ -278,7 +288,7 @@ impl PowerManagementMode {
 }
 
 /// Embassy-net driver.
-pub type NetDriver<'a> = ch::Device<'a, MTU>;
+pub type NetDriver<'a> = ch::Device<'a, CH_MTU>;
 
 /// Create a new instance of the CYW43 driver.
 ///

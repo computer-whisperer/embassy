@@ -62,7 +62,17 @@ pub(crate) struct BtRunner<'d> {
     b2h_read_pointer: u32,
 }
 
-const BT_HCI_MTU: usize = 1024;
+/// Largest HCI packet one slot holds, including the packet-type byte and the
+/// 4-byte rounding the BTSDIO ring applies to payloads.
+///
+/// Sized for LE: an ACL packet is 4 + 251 (LE data length extension max)
+/// = 255 B → 256 rounded; an event is 2 + 255 = 257 → 260 rounded; an HCI
+/// command is 3 + 255 = 258. All fit in 264 with the type byte. The upstream
+/// 1024 was a BR/EDR-sized number: 8 slots × ~760 B of slack, ~6 KB of SRAM
+/// on a BLE-only product (Raven, 2026-10-16). A controller packet that does
+/// not fit is skipped with a warning (see `handle_irq`) rather than
+/// overrunning the slot.
+const BT_HCI_MTU: usize = 264;
 
 /// Represents a packet of size MTU.
 pub(crate) struct BtPacketBuf {
@@ -474,6 +484,20 @@ impl<'a> BtRunner<'a> {
                 break;
             }
             self.b2h_read_pointer = (self.b2h_read_pointer + 4) % BTSDIO_FWBUF_SIZE;
+
+            if 1 + rounded_len as usize > BT_HCI_MTU {
+                // Larger than any LE packet: skip it in the ring rather than
+                // overrun a slot. Loud, because it means the sizing above is
+                // wrong for this controller or a BR/EDR path is active.
+                warn!(
+                    "HCI rx: {} B packet (type {:#04x}) exceeds the {} B slot; dropped",
+                    len, header[3], BT_HCI_MTU
+                );
+                self.b2h_read_pointer = (self.b2h_read_pointer + rounded_len) % BTSDIO_FWBUF_SIZE;
+                bus.bp_write32(self.addr + BTSDIO_OFFSET_BT2HOST_OUT, self.b2h_read_pointer)
+                    .await;
+                continue;
+            }
 
             // Obtain a buf from the channel.
             let mut buf = self.rx_chan.send().await;

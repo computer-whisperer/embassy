@@ -14,7 +14,7 @@ use crate::ioctl::{IoctlState, IoctlType, PendingIoctl};
 pub use crate::spi::SpiBusCyw43;
 use crate::structs::*;
 use crate::util::{aligned_mut, aligned_ref, slice8_mut, slice16_mut, try_until};
-use crate::{CHIP, Core, MTU, events};
+use crate::{CH_MTU, CHIP, Core, F2_BUF_WORDS, events};
 
 #[cfg(feature = "firmware-logs")]
 struct LogState {
@@ -93,7 +93,7 @@ impl FirmwareReader for &[u8] {
 
 /// Driver communicating with the WiFi chip.
 pub struct Runner<'a, BUS> {
-    ch: ch::Runner<'a, MTU>,
+    ch: ch::Runner<'a, CH_MTU>,
     pub(crate) bus: BUS,
 
     ioctl_state: &'a IoctlState,
@@ -120,7 +120,7 @@ where
     BUS: Bus,
 {
     pub(crate) fn new(
-        ch: ch::Runner<'a, MTU>,
+        ch: ch::Runner<'a, CH_MTU>,
         bus: BUS,
         ioctl_state: &'a IoctlState,
         events: &'a Events,
@@ -510,7 +510,7 @@ where
 
     /// Run the CYW43 event handling loop.
     pub async fn run(mut self) -> ! {
-        let mut buf = [0; 512];
+        let mut buf = [0u32; F2_BUF_WORDS];
         loop {
             #[cfg(feature = "firmware-logs")]
             self.log_read().await;
@@ -643,7 +643,7 @@ where
     }
 
     /// Wait for IRQ on F2 packet available
-    async fn handle_irq(&mut self, buf: &mut [u32; 512]) {
+    async fn handle_irq(&mut self, buf: &mut [u32; F2_BUF_WORDS]) {
         match BUS::TYPE {
             BusType::Sdio => {
                 // TODO: get irqs working
@@ -702,7 +702,7 @@ where
     }
 
     /// Handle F2 events while status register is set
-    async fn check_status(&mut self, buf: &mut [u32; 512]) {
+    async fn check_status(&mut self, buf: &mut [u32; F2_BUF_WORDS]) {
         loop {
             match BUS::TYPE {
                 BusType::Spi => {
@@ -711,6 +711,23 @@ where
 
                     if status & STATUS_F2_PKT_AVAILABLE != 0 {
                         let len = (status & STATUS_F2_PKT_LEN_MASK) >> STATUS_F2_PKT_LEN_SHIFT;
+                        if len as usize > F2_BUF_WORDS * 4 {
+                            // Larger than the F2 buffer (see `full-f2`): clock it out
+                            // of the chip in buffer-sized pieces and discard it, so the
+                            // runner keeps going instead of overrunning `buf`.
+                            warn!(
+                                "F2 packet of {} B exceeds the {} B buffer; dropped",
+                                len,
+                                F2_BUF_WORDS * 4
+                            );
+                            let mut left = len as usize;
+                            while left > 0 {
+                                let n = left.min(F2_BUF_WORDS * 4);
+                                self.bus.wlan_read(&mut aligned_mut(buf)[..n]).await;
+                                left -= n;
+                            }
+                            continue;
+                        }
                         self.bus.wlan_read(&mut aligned_mut(buf)[..len as usize]).await;
                         trace!("rx {:02x}", Bytes(&slice8_mut(buf)[..(len as usize).min(48)]));
                         self.rx(&mut slice8_mut(buf)[..len as usize]);
@@ -941,10 +958,15 @@ where
                 trace!("rx pkt {:02x}", Bytes(&packet[..packet.len().min(48)]));
 
                 match self.ch.try_rx_buf() {
-                    Some(mut buf) => {
+                    Some(mut buf) if packet.len() <= buf.len() => {
                         buf[..packet.len()].copy_from_slice(packet);
                         buf.rx_done(packet.len())
                     }
+                    Some(_) => warn!(
+                        "rx data frame of {} B exceeds the {} B channel slot (full-f2 off); dropped",
+                        packet.len(),
+                        CH_MTU
+                    ),
                     None => warn!("failed to push rxd packet to the channel."),
                 }
             }
@@ -966,10 +988,23 @@ where
         self.sdpcm_seq != self.sdpcm_seq_max && self.sdpcm_seq_max.wrapping_sub(self.sdpcm_seq) & 0x80 == 0
     }
 
-    async fn send_ioctl(&mut self, kind: IoctlType, cmd: Ioctl, iface: u32, data: &[u8], buf: &mut [u32; 512]) {
+    async fn send_ioctl(
+        &mut self,
+        kind: IoctlType,
+        cmd: Ioctl,
+        iface: u32,
+        data: &[u8],
+        buf: &mut [u32; F2_BUF_WORDS],
+    ) {
         let buf8 = slice8_mut(buf);
 
         let total_len = SdpcmHeader::SIZE + CdcHeader::SIZE + data.len();
+        assert!(
+            total_len <= buf8.len(),
+            "ioctl of {} B exceeds the {}-word F2 buffer: enable the `full-f2` feature",
+            total_len,
+            F2_BUF_WORDS
+        );
 
         let sdpcm_seq = self.sdpcm_seq;
         self.sdpcm_seq = self.sdpcm_seq.wrapping_add(1);

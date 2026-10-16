@@ -10,7 +10,16 @@ repository = "https://github.com/embassy-rs/embassy"
 documentation = "https://docs.embassy.dev/cyw43"
 
 [features]
+default = ["full-f2"]
 defmt = ["dep:defmt", "heapless/defmt", "embassy-time/defmt", "embedded-io-async?/defmt"]
+# Full-size wifi data path: 512-word F2 (ioctl/event/data) transfer buffer and
+# MTU-sized (1514 B) frame slots in the net-driver channel. Required for any
+# wifi use (`Control::init` loads the CLM in ~1 KB ioctl chunks). Off, the F2
+# buffer is 128 words and the channel slots 64 B: enough for BT bring-up and
+# the WLAN events a never-joined radio emits (Raven BLE-only product: largest
+# observed event 264 B), saving ~4.9 KB of SRAM. Oversized F2 packets and data
+# frames are dropped with a warning instead of overrunning a buffer.
+full-f2 = []
 log = ["dep:log", "dep:derive_more", "derive_more/display"]
 bluetooth = ["dep:bt-hci-transport", "dep:embedded-io-async"]
 
