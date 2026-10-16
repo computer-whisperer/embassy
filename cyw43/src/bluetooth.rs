@@ -17,11 +17,13 @@ use crate::util::round_up;
 use crate::{BtInitError, BtInitTiming, CHIP, util};
 
 /// How long to wait for the BT core's `FW_RDY` / `BT_AWAKE` flags. The
-/// upstream driver asserted after 300 ms; on the CYW43439 a warm-restarted
-/// BT core sometimes never raises `FW_RDY` at all (Raven GH #87), so the
-/// budget is generous enough to tell "slow" from "hung" and the outcome is
-/// reported to the host instead of asserted.
-pub const BT_READY_TIMEOUT_MS: u32 = 2000;
+/// upstream driver asserted after 300 ms. On the CYW43439 a healthy core
+/// raises `FW_RDY` in 110–240 ms; a warm-restarted core sometimes never
+/// raises it at all (Raven GH #87: a 2 s budget hit the full 2 s and only a
+/// power cycle recovered it). So the budget is about twice the slowest
+/// healthy time, and the outcome is reported to the host instead of
+/// asserted, so it can power-cycle and retry promptly.
+pub const BT_READY_TIMEOUT_MS: u32 = 500;
 
 pub(crate) struct BtState {
     rx: [BtPacketBuf; 4],
