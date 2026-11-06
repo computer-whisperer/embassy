@@ -189,6 +189,133 @@ pub unsafe fn set_core1_flash_independent(independent: bool) {
     CORE1_FLASH_INDEPENDENT.store(independent, core::sync::atomic::Ordering::Release);
 }
 
+/// Per-kind lockout statistics since boot: every sector erase and every
+/// page program on this die goes through one [`in_ram`] lockout, and these
+/// count them. Two numbers per lockout are kept apart on purpose:
+///
+/// - `max_us` / `last_us` time the **critical-section body** (DMA drain,
+///   XIP stream drain, the bootrom operation) — the interrupts-off window
+///   the real-time paths suffer. With `max_units` beside it, a long window
+///   over many units reads as a big range, not a slow die.
+/// - `max_us_per_unit` divides that window by the units covered (4 KiB
+///   sectors for an erase, 256 B pages for a program) — the die against its
+///   datasheet (W25Q16JV: sector erase 45 ms typical / 400 ms maximum, page
+///   program 0.4 / 3 ms).
+/// - `max_total_us` spans the whole lockout call: the core-1 pause
+///   handshake and the application's XIP stream handoff around the critical
+///   section — what core 1 sees.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct OpStats {
+    /// Lockouts of this kind since boot.
+    pub count: u32,
+    /// Longest critical-section body (µs) of one lockout, and the units it
+    /// covered.
+    pub max_us: u32,
+    pub max_units: u32,
+    /// Longest per-unit critical-section time (µs per sector / per page).
+    pub max_us_per_unit: u32,
+    /// Longest whole-call span (µs), core-1 pause and stream handoff included.
+    pub max_total_us: u32,
+    /// The most recent lockout: its critical-section body (µs) and units.
+    pub last_us: u32,
+    pub last_units: u32,
+}
+
+/// Both kinds of lockout, as returned by [`op_stats`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct FlashOpStats {
+    /// Sector erases (`blocking_erase`; a range is one lockout).
+    pub erase: OpStats,
+    /// Page programs (`blocking_write`; one lockout per call for RAM-resident
+    /// aligned data, one per page otherwise, plus one per head/tail pad page).
+    pub program: OpStats,
+}
+
+/// The counters behind one [`OpStats`]. Single writer: `in_ram` refuses core
+/// 1, and the flash peripheral is one `&mut` instance, so every update runs
+/// on core 0 in sequence — plain load/store (no read-modify-write atomics,
+/// which thumbv6m lacks) keeps `max_us` and `max_units` from one lockout
+/// together. Readers on either core take relaxed snapshots.
+struct OpCounters {
+    count: core::sync::atomic::AtomicU32,
+    max_us: core::sync::atomic::AtomicU32,
+    max_units: core::sync::atomic::AtomicU32,
+    max_us_per_unit: core::sync::atomic::AtomicU32,
+    max_total_us: core::sync::atomic::AtomicU32,
+    last_us: core::sync::atomic::AtomicU32,
+    last_units: core::sync::atomic::AtomicU32,
+}
+
+impl OpCounters {
+    const fn new() -> Self {
+        use core::sync::atomic::AtomicU32;
+        Self {
+            count: AtomicU32::new(0),
+            max_us: AtomicU32::new(0),
+            max_units: AtomicU32::new(0),
+            max_us_per_unit: AtomicU32::new(0),
+            max_total_us: AtomicU32::new(0),
+            last_us: AtomicU32::new(0),
+            last_units: AtomicU32::new(0),
+        }
+    }
+
+    fn record(&self, lockout: Lockout, units: u32) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let units = units.max(1);
+        self.count.store(self.count.load(Relaxed).wrapping_add(1), Relaxed);
+        if lockout.cs_us > self.max_us.load(Relaxed) {
+            self.max_us.store(lockout.cs_us, Relaxed);
+            self.max_units.store(units, Relaxed);
+        }
+        let per_unit = lockout.cs_us / units;
+        if per_unit > self.max_us_per_unit.load(Relaxed) {
+            self.max_us_per_unit.store(per_unit, Relaxed);
+        }
+        if lockout.total_us > self.max_total_us.load(Relaxed) {
+            self.max_total_us.store(lockout.total_us, Relaxed);
+        }
+        self.last_us.store(lockout.cs_us, Relaxed);
+        self.last_units.store(units, Relaxed);
+    }
+
+    fn snapshot(&self) -> OpStats {
+        use core::sync::atomic::Ordering::Relaxed;
+        OpStats {
+            count: self.count.load(Relaxed),
+            max_us: self.max_us.load(Relaxed),
+            max_units: self.max_units.load(Relaxed),
+            max_us_per_unit: self.max_us_per_unit.load(Relaxed),
+            max_total_us: self.max_total_us.load(Relaxed),
+            last_us: self.last_us.load(Relaxed),
+            last_units: self.last_units.load(Relaxed),
+        }
+    }
+}
+
+static ERASE_STATS: OpCounters = OpCounters::new();
+static PROGRAM_STATS: OpCounters = OpCounters::new();
+
+/// This boot's lockout counters for sector erases and page programs. Lock
+/// free, callable from any core or context.
+pub fn op_stats() -> FlashOpStats {
+    FlashOpStats {
+        erase: ERASE_STATS.snapshot(),
+        program: PROGRAM_STATS.snapshot(),
+    }
+}
+
+/// What one [`in_ram`] lockout cost, in µs of the 1 MHz system timer.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Lockout {
+    /// The critical-section body: interrupts off on this core.
+    pub cs_us: u32,
+    /// The whole call: stream handoff and core-1 pause included.
+    pub total_us: u32,
+}
+
 /// Register the application's XIP-streamer hooks (see [`XipStreamHooks`]).
 /// Call once, before any concurrent streamer use; a later call replaces them.
 pub fn set_xip_stream_hooks(hooks: &'static XipStreamHooks) {
@@ -262,15 +389,12 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> Fl
     pub fn blocking_erase(&mut self, from: u32, to: u32) -> Result<(), Error> {
         check_erase(self, from, to)?;
 
-        trace!(
-            "Erasing from 0x{:x} to 0x{:x}",
-            FLASH_BASE + from,
-            FLASH_BASE + to
-        );
+        trace!("Erasing from 0x{:x} to 0x{:x}", FLASH_BASE + from, FLASH_BASE + to);
 
         let len = to - from;
 
-        unsafe { in_ram(|| ram_helpers::flash_range_erase(from, len))? };
+        let lockout = unsafe { in_ram(|| ram_helpers::flash_range_erase(from, len))? };
+        ERASE_STATS.record(lockout, len / ERASE_SIZE as u32);
 
         Ok(())
     }
@@ -301,7 +425,8 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> Fl
 
             let unaligned_offset = offset as usize - start;
 
-            unsafe { in_ram(|| ram_helpers::flash_range_program(unaligned_offset as u32, &pad_buf))? }
+            let lockout = unsafe { in_ram(|| ram_helpers::flash_range_program(unaligned_offset as u32, &pad_buf))? };
+            PROGRAM_STATS.record(lockout, 1);
         }
 
         let remaining_len = bytes.len() - start_padding;
@@ -319,12 +444,16 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> Fl
             if bytes.as_ptr() as usize >= 0x2000_0000 {
                 let aligned_data = &bytes[start_padding..end_padding];
 
-                unsafe { in_ram(|| ram_helpers::flash_range_program(aligned_offset as u32, aligned_data))? }
+                let lockout =
+                    unsafe { in_ram(|| ram_helpers::flash_range_program(aligned_offset as u32, aligned_data))? };
+                PROGRAM_STATS.record(lockout, (aligned_data.len() / PAGE_SIZE) as u32);
             } else {
                 for chunk in bytes[start_padding..end_padding].chunks_exact(PAGE_SIZE) {
                     let mut ram_buf = [0xFF_u8; PAGE_SIZE];
                     ram_buf.copy_from_slice(chunk);
-                    unsafe { in_ram(|| ram_helpers::flash_range_program(aligned_offset as u32, &ram_buf))? }
+                    let lockout =
+                        unsafe { in_ram(|| ram_helpers::flash_range_program(aligned_offset as u32, &ram_buf))? };
+                    PROGRAM_STATS.record(lockout, 1);
                     aligned_offset += PAGE_SIZE;
                 }
             }
@@ -339,7 +468,8 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize, const READ_BASE: u32> Fl
 
             let unaligned_offset = end_offset - (PAGE_SIZE - rem_offset);
 
-            unsafe { in_ram(|| ram_helpers::flash_range_program(unaligned_offset as u32, &pad_buf))? }
+            let lockout = unsafe { in_ram(|| ram_helpers::flash_range_program(unaligned_offset as u32, &pad_buf))? };
+            PROGRAM_STATS.record(lockout, 1);
         }
 
         Ok(())
@@ -631,7 +761,6 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash
     }
 }
 
-
 /// XIP cache maintenance operations.
 ///
 /// This module provides targeted cache invalidation as an optimization over the bootrom's
@@ -853,23 +982,15 @@ mod hardware_state {
             qmi.mem(0)
                 .timing()
                 .write_value(pac::qmi::regs::Timing(self.qmi_m0_timing));
-            qmi.mem(0)
-                .rcmd()
-                .write_value(pac::qmi::regs::Rcmd(self.qmi_m0_rcmd));
-            qmi.mem(0)
-                .rfmt()
-                .write_value(pac::qmi::regs::Rfmt(self.qmi_m0_rfmt));
+            qmi.mem(0).rcmd().write_value(pac::qmi::regs::Rcmd(self.qmi_m0_rcmd));
+            qmi.mem(0).rfmt().write_value(pac::qmi::regs::Rfmt(self.qmi_m0_rfmt));
 
             // Restore QMI M1 (CS1 - PSRAM) state
             qmi.mem(1)
                 .timing()
                 .write_value(pac::qmi::regs::Timing(self.qmi_m1_timing));
-            qmi.mem(1)
-                .rcmd()
-                .write_value(pac::qmi::regs::Rcmd(self.qmi_m1_rcmd));
-            qmi.mem(1)
-                .rfmt()
-                .write_value(pac::qmi::regs::Rfmt(self.qmi_m1_rfmt));
+            qmi.mem(1).rcmd().write_value(pac::qmi::regs::Rcmd(self.qmi_m1_rcmd));
+            qmi.mem(1).rfmt().write_value(pac::qmi::regs::Rfmt(self.qmi_m1_rfmt));
 
             // Memory barrier to ensure all register writes complete before any
             // subsequent flash accesses.
@@ -1417,12 +1538,19 @@ mod ram_helpers {
 /// Make sure to uphold the contract points with rp2040-flash.
 /// - interrupts must be disabled
 /// - DMA must not access flash memory
-pub(crate) unsafe fn in_ram(operation: impl FnOnce()) -> Result<(), Error> {
+///
+/// Returns what the lockout cost ([`Lockout`]); the erase and program
+/// entry points fold it into [`op_stats`]. Both timestamps read the system
+/// timer (a register read, no critical section) and run with XIP live —
+/// nothing inside `operation` may touch flash, so nothing inside it is
+/// timed separately.
+pub(crate) unsafe fn in_ram(operation: impl FnOnce()) -> Result<Lockout, Error> {
     // Make sure we're running on CORE0
     let core_id: u32 = pac::SIO.cpuid().read();
     if core_id != 0 {
         return Err(Error::InvalidCore);
     }
+    let t_call = embassy_time::Instant::now();
 
     // Stop any application use of the XIP streamer BEFORE pausing core 1: a
     // stream whose consumer is paused never drains, and the `stream_ctr > 0`
@@ -1437,7 +1565,8 @@ pub(crate) unsafe fn in_ram(operation: impl FnOnce()) -> Result<(), Error> {
         crate::multicore::pause_core1();
     }
 
-    critical_section::with(|_| {
+    let cs_us = critical_section::with(|_| {
+        let t_cs = embassy_time::Instant::now();
         // Wait for all DMA channels in flash to finish before ram operation
         const SRAM_LOWER: u32 = 0x2000_0000;
         for n in 0..crate::dma::CHANNEL_COUNT {
@@ -1449,6 +1578,7 @@ pub(crate) unsafe fn in_ram(operation: impl FnOnce()) -> Result<(), Error> {
 
         // Run our flash operation in RAM
         operation();
+        t_cs.elapsed().as_micros() as u32
     });
 
     // Resume CORE1 execution
@@ -1456,7 +1586,10 @@ pub(crate) unsafe fn in_ram(operation: impl FnOnce()) -> Result<(), Error> {
         crate::multicore::resume_core1();
     }
     xip_stream_release();
-    Ok(())
+    Ok(Lockout {
+        cs_us,
+        total_us: t_call.elapsed().as_micros() as u32,
+    })
 }
 
 trait SealedInstance {}
